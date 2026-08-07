@@ -1,0 +1,256 @@
+{
+  "_generated": "2026-08-07T17:23:00-04:00",
+  "_frames_observed": "2026-08-07 17:09-17:15 ET",
+  "_source": "https://webcams.nyctmc.org/api/cameras  (frames: /api/cameras/{id}/image, 352x240 JPEG, no auth)",
+  "neighborhood": { "name": "Sheepshead Bay", "lat": 40.5865, "lon": -73.944 },
+
+  "conventions": {
+    "frame_size": [352, 240],
+    "origin": "top-left, x right, y down",
+    "polygon_units": "pixels on the raw 352x240 frame",
+    "banner_exclusion": "Every camera burns a timestamp banner into rows y=0..26. No polygon enters that band. Crop y>=28 before detection.",
+    "direction_rule": "Right-hand traffic. In a down-the-road view, vehicles moving AWAY from the camera occupy the frame-RIGHT side of the centerline/median; vehicles moving TOWARD the camera occupy the frame-LEFT side. Verified empirically on Belt Pkwy @ Plumb 3 St by tracking a queued vehicle across 3 frames 4s apart (it moved down-and-left, i.e. toward the camera, on the far/left carriageway), and independently by pavement-legend orientation on Coney Island Ave @ Kings Hwy (inverted 'ONLY' legend = camera is looking at oncoming traffic).",
+    "split_vs_label": "Two separate confidences matter. 'split_confidence' = how cleanly the two travel directions occupy disjoint image regions. 'label_confidence' = how sure we are which of those regions is INBOUND to Sheepshead Bay (this requires knowing the camera's compass heading, which NYC DOT does not publish). Only the second one is shaky. Every camera exposes 'flip_hint': true so the UI can offer a one-key swap on stage.",
+    "demand_signal": "inbound_count / (inbound_count + outbound_count) per frame, smoothed. >0.5 = net inflow = parking filling up."
+  },
+
+  "cameras": [
+    {
+      "id": "111e79a9-eb5a-44d0-b062-481ac0a81901",
+      "name": "Belt Pkwy @ Plumb 3 St",
+      "lat": 40.585,
+      "lon": -73.9288,
+      "distance_mi": 0.81,
+      "role": "gateway_primary",
+      "rank": 1,
+      "quality": 5,
+      "road_axis": "east-west",
+      "camera_heading": "east",
+      "inbound_bearing": "westbound",
+      "flip_hint": true,
+      "overlay_text": "08/07/2026 05:14:57 PM — white text on dark grey banner, rows y=0..17, full width. Ticks every second; excellent liveness proof.",
+      "notes": "Best camera in the set by a wide margin. Textbook down-the-road view of a median-divided parkway: near carriageway (lower-right) is 3 clean lanes with a yellow median edge line and a white shoulder line; far carriageway (upper-left) sits beyond a double guardrail on a wooded embankment. 25-40 vehicles in frame at 5 PM. Far carriageway was in stop-and-go queue back past the overpass; near carriageway free-flowing — a genuinely legible asymmetry, which is exactly the demo. Vehicles in the near carriageway are 25-45 px wide, far carriageway 12-20 px: both detectable at native 352x240, though the far/queued side benefits from a 2x upscale before inference. A VMS reading 'NY STATE LAW / NO TRUCKS ON PARKWAYS!!' sits in the upper right and is legible — bonus liveness proof, but keep it out of polygons (it is above the roadway anyway). Heading reasoning: the frame-left side is a wooded embankment with a multi-storey brick apartment block; the frame-right side is flat mown grass with no structures. At 40.585,-73.9288 the Belt has Plumb Beach / Rockaway Inlet to the SOUTH (open, no buildings) and the Plumb Beach residential area to the NORTH. So frame-left = north, camera faces EAST, and the far/left carriageway is westbound = heading into Sheepshead Bay.",
+      "regions": {
+        "inbound": {
+          "polygon": [[0, 143], [0, 177], [268, 132], [268, 114]],
+          "confidence": "medium",
+          "split_confidence": "high",
+          "label_confidence": "medium",
+          "means": "westbound Belt Pkwy — approaching Knapp St / Emmons Ave / Sheepshead Bay",
+          "note": "Far carriageway beyond the median guardrail. Region boundary is a physical barrier, so no cross-contamination. Band gets thin past x=268 (perspective); do not extend further right or the two directions merge visually."
+        },
+        "outbound": {
+          "polygon": [[18, 237], [248, 237], [286, 136], [176, 152]],
+          "confidence": "medium",
+          "split_confidence": "high",
+          "label_confidence": "medium",
+          "means": "eastbound Belt Pkwy — leaving Sheepshead Bay toward Marine Park / Flatbush Ave / Queens",
+          "note": "Near carriageway. Bounded upper-left by the median guardrail, lower-right by the white shoulder edge line."
+        }
+      }
+    },
+
+    {
+      "id": "9bdd7740-762f-48e9-b40c-3db03c2a43f5",
+      "name": "Belt Pkwy @ Ocean Pkwy",
+      "lat": 40.583257,
+      "lon": -73.966656,
+      "distance_mi": 1.21,
+      "role": "gateway_primary",
+      "rank": 2,
+      "quality": 4,
+      "road_axis": "east-west",
+      "camera_heading": "west",
+      "inbound_bearing": "eastbound",
+      "flip_hint": true,
+      "overlay_text": "'Fri Aug  7 2026 05:09:43 PM' — white on solid black banner, rows y=0..17, full width.",
+      "notes": "The western bookend to Plumb 3 St, so the pair brackets the neighborhood. Divided parkway again, concrete median wall on the left, near carriageway 3 lanes with a large chevron-hatched gore on the right. Very high volume: 40+ vehicles, with a dense queue running to the vanishing point on the far carriageway. Hazier/lower-contrast than Plumb 3 St and the far queue compresses into sub-10 px blobs near the horizon, so cap the inbound polygon at x=262 as configured. Heading reasoning: two independent signals agree. (1) Tall apartment towers (Trump Village / Warbasse / Luna Park, which are SOUTH-WEST of this point) occupy the upper-left; Gravesend to the north is low-rise, so frame-left = south, camera faces WEST. (2) The overhead guide sign 'EXIT 7A / Coney Is - Shell Rd / EXIT ONLY' is legible to us, meaning it faces oncoming traffic on the far/left carriageway; Coney Island Ave is the next interchange EAST of Ocean Pkwy and Belt exit numbers increase eastward, so that carriageway is eastbound. Both give: far/left = eastbound = inbound.",
+      "regions": {
+        "inbound": {
+          "polygon": [[55, 150], [62, 172], [262, 133], [258, 118]],
+          "confidence": "medium",
+          "split_confidence": "high",
+          "label_confidence": "medium",
+          "means": "eastbound Belt Pkwy — approaching Coney Island Ave / Sheepshead Bay",
+          "note": "Far carriageway beyond the median wall. Currently the congested side."
+        },
+        "outbound": {
+          "polygon": [[0, 190], [0, 238], [205, 238], [240, 152]],
+          "confidence": "medium",
+          "split_confidence": "high",
+          "label_confidence": "medium",
+          "means": "westbound Belt Pkwy — leaving toward Coney Island / Bay Ridge / Verrazano",
+          "note": "Near carriageway. Right boundary stops short of the chevron gore at x~205 so ramp/merge vehicles are not double counted."
+        }
+      }
+    },
+
+    {
+      "id": "9e3164a8-1c63-4790-bc24-f9d752f3ae41",
+      "name": "Belt Pkwy @ Flatbush Ave",
+      "lat": 40.595641,
+      "lon": -73.907647,
+      "distance_mi": 2.01,
+      "role": "gateway_primary",
+      "rank": 3,
+      "quality": 4,
+      "road_axis": "east-west",
+      "camera_heading": "east",
+      "inbound_bearing": "westbound",
+      "flip_hint": true,
+      "overlay_text": "'2026-08-07 05:10:23 PM' — white on black, rows y=0..17 but only x=0..164 (left half). Note the different date format from the other cams; do not assume one parser.",
+      "notes": "Clean, bright, high-contrast frame — the sharpest of the three parkway cams. Elevated view over open marshland (Marine Park / Gerritsen Creek) so there are no trees or buildings occluding the roadway. Two carriageways separated by a guardrail, plus a chevron gore and an exit ramp peeling off to the right toward the Flatbush Ave interchange. 30+ vehicles, near-carriageway vehicles 30-60 px wide — the easiest detection target in the whole set. Heading reasoning: the exit ramp diverges to the RIGHT off the away-from-camera carriageway, and the camera sits essentially at the Flatbush Ave interchange, so the away carriageway is the one signed for Flatbush = eastbound; camera faces EAST. Weakness is semantic, not visual: at 2.0 mi east, a large share of the traffic here is through-traffic to the Rockaways and Marine Park that will never park in Sheepshead Bay. Use it as corroboration, not as the headline number.",
+      "regions": {
+        "inbound": {
+          "polygon": [[0, 128], [0, 152], [168, 96], [172, 86]],
+          "confidence": "medium",
+          "split_confidence": "high",
+          "label_confidence": "medium",
+          "means": "westbound Belt Pkwy — heading toward Knapp St / Sheepshead Bay",
+          "note": "Far carriageway above the median guardrail. Narrow band; upscale 2x before detection."
+        },
+        "outbound": {
+          "polygon": [[0, 235], [95, 235], [188, 120], [100, 120]],
+          "confidence": "medium",
+          "split_confidence": "high",
+          "label_confidence": "medium",
+          "means": "eastbound Belt Pkwy — leaving toward Flatbush Ave / Marine Pkwy Bridge / Queens",
+          "note": "Near carriageway, bounded left by the median guardrail and right by the shoulder guardrail. Excludes the chevron gore and the exit ramp."
+        }
+      }
+    },
+
+    {
+      "id": "899dfa1e-a2c5-490a-b8ba-480493634846",
+      "name": "Coney Island Ave @ Kings Hwy",
+      "lat": 40.607272,
+      "lon": -73.961707,
+      "distance_mi": 1.71,
+      "role": "fallback",
+      "rank": 4,
+      "quality": 3,
+      "road_axis": "north-south",
+      "camera_heading": "north (inferred, see notes)",
+      "inbound_bearing": "southbound",
+      "flip_hint": true,
+      "recommended_for_ratio": true,
+      "overlay_text": "'08/07/2026 05:09:45 PM' — white text burned directly onto the image (no solid banner), rows y=0..26. Slightly harder to mask than the banner cams; crop y>=28.",
+      "notes": "Highest raw image quality of anything in range — sharp, well lit, vehicles 40-90 px, pedestrians individually resolvable. It is also the only genuine surface-street approach to the neighborhood I could find within 2 miles. But it is an intersection camera and that hurts it three ways: (1) volume is low, 4-10 vehicles per frame vs 30+ on the Belt; (2) a large fraction of vehicles are stopped at the light or turning onto Kings Hwy, so presence in a lane does not imply travel in that direction; (3) the double-yellow centerline sits far to the frame-left (x~120-131), so the two directions get very unequal pixel area and the counts need normalizing. The travel-direction SPLIT is verified: the elongated 'ONLY' pavement legend left of the centerline reads inverted from the camera's viewpoint (= that traffic is oncoming) while the legend right of the centerline reads upright (= that traffic is receding). The compass LABEL is the weak part: I inferred the camera faces north because the building on the frame-right is brightly sunlit at 5 PM (so it faces west, so it is on the east side of the street, so frame-right = east, so the camera looks north). That is a one-signal inference and it conflicts with my read of the left-turn-bay geometry. Treat the inbound/outbound assignment here as a coin-flip-with-a-thumb-on-the-scale and say so on stage.",
+      "regions": {
+        "inbound": {
+          "polygon": [[83, 70], [117, 70], [131, 140], [33, 140]],
+          "confidence": "low",
+          "split_confidence": "medium",
+          "label_confidence": "low",
+          "means": "southbound Coney Island Ave — toward Ave U / Sheepshead Bay / Brighton",
+          "note": "Frame-left of the double-yellow, north of the Kings Hwy stop bar. Deliberately stops at y=140 to stay out of the intersection box where turning traffic contaminates both directions."
+        },
+        "outbound": {
+          "polygon": [[120, 70], [190, 66], [235, 135], [134, 140]],
+          "confidence": "low",
+          "split_confidence": "medium",
+          "label_confidence": "low",
+          "means": "northbound Coney Island Ave — leaving toward Midwood / Prospect Park",
+          "note": "Frame-right of the double-yellow. Includes the curb parking lane; filter parked vehicles by requiring inter-frame motion, or the outbound count will be inflated by static parked cars."
+        }
+      }
+    },
+
+    {
+      "id": "64ed1f5d-ba90-4c12-afda-9a9c3e658efd",
+      "name": "Ocean Pkwy @ Ave X",
+      "lat": 40.591079,
+      "lon": -73.965347,
+      "distance_mi": 1.17,
+      "role": "context_only",
+      "rank": 5,
+      "quality": 2,
+      "road_axis": "north-south",
+      "camera_heading": "south",
+      "inbound_bearing": "n/a",
+      "flip_hint": false,
+      "recommended_for_ratio": false,
+      "overlay_text": "'Facing South  Fri Aug  7 2026 05:09:43 PM' — the heading is burned in, which is why this camera's compass direction is the only certain one in the set. Rows y=0..18.",
+      "notes": "Close (1.17 mi) and the only camera that states its own heading, but weak for this project on two counts. Visually: the frame is dominated by an empty intersection and crosswalk, 2-4 moving vehicles, and Ocean Pkwy's tree-lined mall splits the view into a main roadway on the frame-left and a service road with parked cars on the frame-right — so the two through directions are not cleanly separated by any line I can draw. Semantically: Ocean Pkwy southbound feeds Brighton Beach and Coney Island, not Sheepshead Bay; it runs past the neighborhood rather than into it. Listed so the app can show 'Facing South' as a worked example of a self-labelling camera, and as an emergency third option. No polygons supplied on purpose — see below.",
+      "regions": {
+        "inbound": {
+          "polygon": null,
+          "confidence": "low",
+          "split_confidence": "low",
+          "label_confidence": "low",
+          "means": "not determinable from this angle",
+          "note": "Refusing to draw one. The main roadway's two directions overlap in image space at this angle and the service road adds a third stream. Any polygon here would look confident and be wrong."
+        },
+        "outbound": {
+          "polygon": null,
+          "confidence": "low",
+          "split_confidence": "low",
+          "label_confidence": "low",
+          "means": "not determinable from this angle",
+          "note": "Same."
+        }
+      }
+    },
+
+    {
+      "id": "a40475d9-6266-4f92-b695-bb6addd39892",
+      "name": "Flatbush Ave @ Ave U",
+      "lat": 40.609864,
+      "lon": -73.922379,
+      "distance_mi": 1.97,
+      "role": "context_only",
+      "rank": 6,
+      "quality": 3,
+      "road_axis": "Flatbush NE-SW / Ave U E-W",
+      "camera_heading": "west",
+      "inbound_bearing": "westbound (Ave U)",
+      "flip_hint": true,
+      "recommended_for_ratio": false,
+      "overlay_text": "'Facing West  Fri Aug  7 2026 05:10:27 PM' — heading burned in, rows y=0..18.",
+      "notes": "Tempting because Ave U westbound really is the main surface artery into Sheepshead Bay, and the camera helpfully declares 'Facing West'. But the frame shows essentially ONE approach: a wide multi-lane stop-bar queue with left-turn-ONLY arrows, plus cross traffic on the right. The opposing direction is not usefully in frame, so an inbound/outbound ratio from this camera would be measuring one direction against noise. Good B-roll for a slide ('here is Ave U, the road people actually take'), not good for the metric. No polygons.",
+      "regions": {
+        "inbound": {
+          "polygon": null,
+          "confidence": "low",
+          "split_confidence": "low",
+          "label_confidence": "low",
+          "means": "single-approach view; opposing direction not in frame",
+          "note": "Not drawn."
+        },
+        "outbound": {
+          "polygon": null,
+          "confidence": "low",
+          "split_confidence": "low",
+          "label_confidence": "low",
+          "means": "single-approach view; opposing direction not in frame",
+          "note": "Not drawn."
+        }
+      }
+    }
+  ],
+
+  "recommended_set": {
+    "primary": [
+      "111e79a9-eb5a-44d0-b062-481ac0a81901",
+      "9bdd7740-762f-48e9-b40c-3db03c2a43f5",
+      "9e3164a8-1c63-4790-bc24-f9d752f3ae41"
+    ],
+    "fallback": "899dfa1e-a2c5-490a-b8ba-480493634846",
+    "rejected": [
+      "64ed1f5d-ba90-4c12-afda-9a9c3e658efd",
+      "a40475d9-6266-4f92-b695-bb6addd39892",
+      "856ef0b2-123d-4211-9619-1334fb7ac219",
+      "26b347aa-b8c0-4539-b061-87c8a6472d04",
+      "b6558fc0-d62b-4b25-b7aa-6b592bde2c44"
+    ]
+  },
+
+  "known_limitations": [
+    "NYC DOT publishes no compass heading for most cameras. Six of the ~968 cameras in range burn a 'Facing X' string into the image; the three we rely on do not. Every inbound/outbound LABEL below is inferred from scene geography, sun angle on building facades, and highway signage, not from metadata. The region SPLIT is solid; the label could be inverted. flip_hint exists for this reason.",
+    "There is NO traffic camera on Emmons Ave, Sheepshead Bay Rd, Nostrand Ave, Knapp St, Ave U (within the neighborhood), Ave X, or Ave Z. Searched all 968 cameras case-insensitively. The nearest thing to a neighborhood street cam is Coney Island Ave @ Kings Hwy, 1.71 mi north. We are measuring the parkway that feeds the neighborhood, not the neighborhood itself.",
+    "Belt Pkwy carries through-traffic to the Rockaways, JFK and Long Island. A westbound car at Plumb 3 St is not necessarily parking in Sheepshead Bay. The signal is a proxy for demand, not a count of arrivals. This is worth naming before a judge does.",
+    "352x240 is the only resolution offered. Vehicles in the far carriageway of each parkway cam are 10-20 px wide. Upscale 2x before inference or the far-side counts will be systematically low, which biases the ratio.",
+    "Frames refresh roughly every 1-2 seconds and each camera stamps its own clock; the three primaries were observed within 40s of each other, not synchronized. Do not compute cross-camera ratios at sub-minute granularity.",
+    "All nine cameras checked were online at 17:15 ET Aug 7 2026. NYC DOT cams drop out without warning; the app should treat a non-200 or an unchanged MD5 across 60s as offline and fall back."
+  ]
+}

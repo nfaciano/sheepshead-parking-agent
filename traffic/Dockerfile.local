@@ -1,0 +1,15 @@
+# PATH B - local ultralytics. ~1.5GB image. No API key at runtime.
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libglib2.0-0 libgl1 && rm -rf /var/lib/apt/lists/*
+COPY requirements-local.txt .
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+      -r requirements-local.txt
+# Bake the weights in so the container never downloads at cold start.
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11s.pt')" && \
+    cp /root/.config/Ultralytics/../../yolo11s.pt /app/ 2>/dev/null || \
+    python -c "from ultralytics import YOLO; import shutil; m=YOLO('yolo11s.pt'); shutil.copy(m.ckpt_path,'/app/yolo11s.pt')"
+COPY counter.py app.py ./
+ENV PORT=8080 YOLO_CONFIG_DIR=/tmp
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 2 --timeout 300 app:app

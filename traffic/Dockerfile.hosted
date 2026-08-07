@@ -1,0 +1,8 @@
+# PATH A - Roboflow hosted inference. Tiny image (~150MB), no model weights.
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements-hosted.txt .
+RUN pip install --no-cache-dir -r requirements-hosted.txt
+COPY counter.py app.py ./
+ENV PORT=8080
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 4 --timeout 120 app:app

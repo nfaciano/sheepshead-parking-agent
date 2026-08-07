@@ -1,0 +1,11 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+# Roboflow hosted inference. Deliberately NOT ultralytics+torch: that path is
+# ~1.5GB and would turn a 262MB image into a slow Cloud Run cold start, which
+# is exactly the wrong tradeoff for a live demo. Detection runs on Roboflow's
+# serverless endpoint; this container stays a thin agent.
+requests==2.32.3
+# python:3.12-slim ships without the IANA tz database; verdict.py needs
+# America/New_York. This is a tiny pure-data wheel, no build step.
+tzdata==2024.2
