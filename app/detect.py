@@ -22,17 +22,28 @@ import os
 from typing import Optional, TypedDict
 
 
-class VehicleCounts(TypedDict):
+class VehicleCounts(TypedDict, total=False):
     inbound: int
     outbound: int
     total: int
+    # Only the Gemini backend fills these. A detector returns boxes; a VLM returns
+    # a reading of the scene, and the reading is what the verdict actually wants.
+    congestion_inbound: str
+    congestion_outbound: str
+    conditions: str
+    note: str
+    model: str
 
 
-# DETECTOR=stub (default)  -> hashed placeholder counts, demo always runs.
-# DETECTOR=zones           -> real counter in traffic/counter.py, ROI polygons.
-#                             Uses RoboflowHosted if ROBOFLOW_API_KEY is set,
-#                             else LocalYOLO. Falls back to stub if unavailable.
-DETECTOR_BACKEND = os.environ.get("DETECTOR", "stub").lower()
+# DETECTOR=gemini (default) -> Gemini vision reads the frame. Needs GOOGLE_API_KEY.
+# DETECTOR=zones            -> YOLO/Roboflow box counting in traffic/counter.py.
+# DETECTOR=stub             -> hashed placeholder counts; the demo still runs.
+#
+# Gemini is the default because the question is "is traffic into the neighborhood
+# heavy," not "how many cars are in frame." A box count means nothing without
+# knowing the camera's zoom and how much road is in view; "the outbound side is
+# stopped and the inbound side is free-flowing" means something immediately.
+DETECTOR_BACKEND = os.environ.get("DETECTOR", "gemini").lower()
 
 # Which classes count as a vehicle, for the real implementation.
 VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle", "van"}
@@ -58,13 +69,82 @@ def count_vehicles(
 
     Every backend degrades to the stub rather than breaking the demo.
     """
+    if DETECTOR_BACKEND in ("gemini", "vlm"):
+        counts = _count_via_gemini(jpeg_bytes, camera_id)
+        if counts is not None:
+            return counts
+        # Fall through rather than break the demo.
+
     if DETECTOR_BACKEND in ("zones", "roboflow", "yolo"):
         counts = _count_via_zones(jpeg_bytes, camera_id)
         if counts is not None:
             return counts
-        # Fall through to the stub rather than break the demo.
 
     return _count_stub(jpeg_bytes, inbound_side)
+
+
+# ---------------------------------------------------------------------------
+# Gemini vision backend
+# ---------------------------------------------------------------------------
+
+_gemini_failed = False
+
+SIDE_DESCRIPTIONS = {
+    "left": "on the left side of the frame",
+    "right": "on the right side of the frame",
+    "top": "in the upper half of the frame",
+    "bottom": "in the lower half of the frame",
+}
+
+
+def _count_via_gemini(
+    jpeg_bytes: bytes,
+    camera_id: str | None,
+) -> Optional[VehicleCounts]:
+    """Read the frame with Gemini. None if unavailable, so the caller degrades."""
+    global _gemini_failed
+    if _gemini_failed:
+        return None
+
+    try:
+        from . import vision
+    except Exception:  # noqa: BLE001 - requests missing, etc.
+        _gemini_failed = True
+        return None
+
+    if not vision.available():
+        _gemini_failed = True
+        return None
+
+    from .cameras import CAMERAS_BY_ID
+
+    cam = CAMERAS_BY_ID.get(camera_id) if camera_id else None
+    name = getattr(cam, "name", None) or "an NYC DOT traffic camera"
+    # A spatial hint beats a directional one: the model can see which half of the
+    # frame a vehicle is in, but it has no idea which compass direction the camera
+    # faces. cameras.json carries the side; we hand over the side, not a heading.
+    inbound_desc = SIDE_DESCRIPTIONS.get(
+        getattr(cam, "inbound_side", "left"), "on the left side of the frame"
+    )
+
+    try:
+        read = vision.read_frame(jpeg_bytes, name, inbound_desc)
+    except Exception:  # noqa: BLE001 - upstream API failure; degrade, don't crash
+        # Deliberately not latching _gemini_failed here: a single timeout or a
+        # rate-limit blip should not disable vision for the rest of the process.
+        # Only a structural problem (no key, no module) latches, above.
+        return None
+
+    return VehicleCounts(
+        inbound=int(read.get("inbound", 0)),
+        outbound=int(read.get("outbound", 0)),
+        total=int(read.get("total", 0)),
+        congestion_inbound=read.get("congestion_inbound", ""),
+        congestion_outbound=read.get("congestion_outbound", ""),
+        conditions=read.get("conditions", ""),
+        note=read.get("note", ""),
+        model=read.get("model", ""),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +269,12 @@ def is_stub() -> bool:
     """
     if DETECTOR_BACKEND == "stub":
         return True
+    if DETECTOR_BACKEND in ("gemini", "vlm"):
+        try:
+            from . import vision
+        except Exception:  # noqa: BLE001
+            return True
+        return not vision.available()
     return _get_zone_backend() is None
 
 
@@ -196,6 +282,14 @@ def backend_name() -> str:
     """The backend actually in use, not the one requested."""
     if DETECTOR_BACKEND == "stub":
         return "stub"
+    if DETECTOR_BACKEND in ("gemini", "vlm"):
+        try:
+            from . import vision
+        except Exception:  # noqa: BLE001
+            return f"stub (requested '{DETECTOR_BACKEND}', requests missing)"
+        if not vision.available():
+            return "stub (requested 'gemini', GOOGLE_API_KEY not set)"
+        return f"gemini ({vision._working_model or 'resolving'})"
     pair = _get_zone_backend()
     if pair is None:
         return f"stub (requested '{DETECTOR_BACKEND}', unavailable)"

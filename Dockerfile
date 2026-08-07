@@ -13,6 +13,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# The pre-fetched DOT sign inventory. Without this the address lookup silently
+# returns zero block faces in the container while working perfectly on a laptop --
+# which is exactly what happened on the first deploy. It is data the app cannot
+# function without, not an optional asset.
+COPY data/sheepshead_signs.json ./data/sheepshead_signs.json
+
+# Readings taken before this deploy, so the trend chart shows the whole evening
+# rather than restarting from zero every time we ship. Optional -- the app works
+# without it, it just has a shorter history.
+COPY data/history.jsonl ./data/history.jsonl
+
 # Cloud Run injects $PORT (8080 by default) and requires binding 0.0.0.0.
 ENV PORT=8080
 EXPOSE 8080

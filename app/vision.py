@@ -45,8 +45,8 @@ TIMEOUT = 25
 PROMPT = """You are looking at a still frame from a New York City DOT traffic camera.
 It is low resolution (352x240). Ignore any burned-in timestamp banner.
 
-This camera watches {name}. Traffic moving {inbound_desc} is heading INTO the
-Sheepshead Bay neighborhood. Traffic moving the other way is heading OUT.
+This camera watches {name}. Vehicles {inbound_desc} are heading INTO the Sheepshead
+Bay neighborhood. Vehicles on the other side of the roadway are heading OUT.
 
 Report only vehicle flow. Do not describe or identify any person. Do not read any
 license plate. Do not describe individual vehicles.

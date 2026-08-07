@@ -1,220 +1,207 @@
-# Should I Drive to Sheepshead Bay?
+# Which street should I try?
 
-**Live demo (Cloud Run):** _paste your service URL here after deploying_
+My uncle lives in Sheepshead Bay. When he gets home around 7 PM he circles the block
+for twenty minutes, because there is no way to know which street is worth trying.
 
-An agent that answers one question honestly: **is it worth driving into Sheepshead Bay,
-Brooklyn right now to look for parking?**
+This answers that. You type where you're headed; it ranks every block face within a
+few minutes' walk by where you're most likely to find a legal spot — reading the
+posted DOT sign for each block, checking whether alternate side parking is about to
+churn it, and watching the live traffic camera on the road that feeds it.
 
-It reads live NYC DOT traffic cameras positioned on the four roads *into* the neighborhood,
-counts vehicles heading in versus heading out, folds in the NYC parking regulations that are
-actually in effect at this moment, and returns a plain-English verdict.
+**Live:** https://sheepshead-420329548463.us-east1.run.app
 
-Not a dashboard of numbers. An answer: *"Yes — go now."* or *"No — don't bother."*
+```
+Avenue Z — south side                     GOOD    2 min walk · 456 ft
+between East 13 Street and East 14 Street
+Legal now; must move by Sat 8:00 AM
+Traffic in via Ocean Pkwy @ Ave X — light (little competition)
+```
 
-![The demo page: verdict in big type over four live NYC DOT camera feeds](demo.png)
+Coverage: **1,224 block faces across 143 streets**, 4 gateway cameras.
 
 ---
 
-## The honest limitation
+## What it actually knows, and what it doesn't
 
-**This is a demand estimate, not a spot finder.**
+This is the part most worth reading.
 
-It cannot see an open parking space. There is no camera pointed at the curb you want. What it
-can see is the flow of cars into a neighborhood, which is the leading indicator of how hard
-the search is about to be. It tells you whether to expect a 2-minute loop or a 20-minute crawl.
+**It is a demand estimate, not a spot finder.** It cannot see an open space. Nothing
+in the pipeline knows where a parking spot is.
 
-It will not tell you where to park. Anyone claiming otherwise from public traffic cameras is
-overselling.
+**It watches gateways, not blocks.** There is no NYC DOT camera on Emmons Ave, or
+Sheepshead Bay Rd, or Ave X — we checked all 968 cameras in the city. The nearest
+surface-street camera is 1.7 miles north. So the system watches the parkways and
+arterials that feed the neighborhood and infers pressure from what flows in. Belt
+Parkway also carries through-traffic that will never park in Sheepshead Bay, which
+inflates the signal.
 
-Secondary limitations, stated plainly:
+**The direction split is solid; the direction label is not.** On a divided parkway a
+guardrail physically separates the two carriageways, so assigning a vehicle to one
+side or the other is reliable. But DOT publishes no compass heading per camera, so
+which side means "into the neighborhood" is inferred from scene geography. That label
+carries a confidence value in `cameras.json`, and two cameras where the split would
+have been a guess are deliberately left `null` rather than filled in with a
+confident-looking wrong answer.
 
-- The inbound/outbound split uses a coarse left/right frame heuristic per camera, not surveyed
-  lane geometry. A camera whose view was re-aimed by NYC DOT would silently mis-attribute direction.
-- The scoring weights in `verdict.py` are hand-tuned intuition. There is no labeled dataset of
-  "how long did it actually take to park here at time T," so nothing is calibrated against truth.
-- Four cameras is a thin sample of a neighborhood's road network. They are the main gateways,
-  not all of them.
+**A vision-language model is less reproducible than a detector.** Two reads of the
+same frame can differ by a vehicle or two. Temperature is pinned to 0 to reduce that,
+and the output leans on a coarse congestion level rather than pretending a count is
+exact.
 
-## Privacy stance
+**The scoring weights are not calibrated.** There is no ground-truth dataset of how
+long it actually took to park in Sheepshead Bay at time T. The score is a documented
+heuristic, not a measurement.
 
-**Vehicle counts only. No plates, no faces.**
+## Privacy
 
-- The pipeline counts vehicles. It does not read license plates. It does not detect, match,
-  or store faces.
-- Frames live in memory for a few seconds and are never written to disk or to any database.
-- The only thing that leaves the detector is an integer.
-- The camera feeds are public NYC DOT infrastructure at 352x240 — a resolution at which
-  individual identification is not meaningfully possible, and we do not attempt it regardless.
+**Vehicle counts and flow only. No plates, no faces, nothing stored.**
+
+This is structural, not a policy we adopted. NYC DOT camera stills are 352x240, where
+a vehicle is 15-40 pixels wide. A license plate or a face is not resolvable at that
+scale — it is not in the data to begin with. On top of that the prompt explicitly
+asks for flow only and forbids describing any person, and frames live in memory for
+the length of one request and are never written to disk.
+
+---
+
+## The idea
+
+Traffic tells you how many cars are **arriving**. It tells you nothing about whether
+any are **leaving**. For street parking, the second number is the one that matters.
+
+What makes parked cars leave in New York is **alternate side parking**. When a street
+sweeper is coming, an entire block face has to clear out and spots churn. When ASP is
+suspended for a holiday, nobody moves and the neighborhood locks solid.
+
+So the same traffic reading produces opposite answers:
+
+> **Today:** ASP runs tomorrow morning. That block face has to empty. Go now.
+>
+> **August 15:** Feast of the Assumption, ASP suspended, nobody has to move their car.
+> The curb stays exactly as full as it already is. Don't bother.
+
+That inversion is the whole point of the project. It is also the part a traffic
+dashboard cannot tell you.
 
 ## Architecture
 
-1. `cameras.py` — four NYC DOT gateway cameras into Sheepshead Bay; async JPEG fetch with a 3s TTL cache so a room full of demo viewers doesn't hammer the public API.
-2. `detect.py` — `count_vehicles(jpeg_bytes) -> {inbound, outbound, total}`. The one seam a real detector plugs into.
-3. `verdict.py` — combines weighted inbound pressure with live NYC parking rules (alternate side, meter hours, time of day) into a 0-100 pressure score and English phrasing.
-4. `main.py` — FastAPI: HTML demo page, JSON API, and a JPEG proxy that sidesteps browser CORS/mixed-content.
-5. `Dockerfile` — `python:3.12-slim`, binds `0.0.0.0:$PORT`, deployed on **Google Cloud Run**.
-
 ```
-Browser ──▶ FastAPI (Cloud Run)
-                │
-                ├─▶ NYC DOT cameras ──▶ detect.count_vehicles() ──┐
-                │                                                  ▼
-                └─▶ NYC parking rules ──────────────────▶ verdict.build_verdict()
-                                                                   │
-                                                          plain-English answer
+                        your address
+                             │
+                    census geocode → NY State Plane
+                             │
+    ┌────────────────────────┼────────────────────────┐
+    │                        │                        │
+6,288 DOT curb signs   ASP calendar          4 gateway cameras
+grouped into           (42 holidays,          → Gemini reads flow
+1,224 block faces       hardcoded)              + congestion per side
+    │                        │                        │
+    │   is it legal          │  will it churn         │  who's competing
+    │   right now?           │  by morning?           │  for this block?
+    └────────────────────────┼────────────────────────┘
+                             │
+                  ranked block faces near you
 ```
 
-## The cameras
+Everything runs on **Google Cloud Run**.
 
-| Camera | Approach |
+| Module | Does |
 |---|---|
-| Belt Pkwy @ Plumb 3 St | Belt Parkway, eastern approach |
-| Ocean Pkwy @ Ave X | Ocean Parkway, northern approach |
-| Belt Pkwy @ Ocean Pkwy | Belt Parkway western / Ocean Pkwy interchange |
-| Coney Island Ave @ Kings Hwy | Coney Island Avenue, northern surface approach |
+| `app/blocks.py` | Address → nearby block faces, ranked. The product |
+| `app/parking.py` | ASP calendar + the NYC sign-text parser |
+| `app/vision.py` | Gemini frame reads; ranks and falls through available models |
+| `app/detect.py` | Backend seam — `gemini` \| `zones` \| `stub`, degrades without crashing |
+| `app/cameras.py` | Camera config, frame fetching, caching |
+| `app/verdict.py` | Neighborhood-wide conditions and scoring |
+| `app/main.py` | FastAPI, background refresh, history, the page |
+| `scripts/track.py` | Standalone logger; survives redeploys |
 
-Source: NYC DOT Traffic Management Center public camera API (`webcams.nyctmc.org`).
-Public, no authentication, no API key.
+### How a block gets ranked
 
-## Run it locally
+Three real signals, in order of how much they're worth:
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
-```
+1. **Legality** — from the posted sign record for that exact block face. Hard gate.
+2. **Duration** — how long until you'd have to move. Overnight beats a 2-hour meter.
+3. **Walk** — distance from the address you typed.
 
-Open <http://localhost:8080>. Or `make install && make run`.
+Then the nearest gateway camera's inbound congestion discounts the score by up to
+30%. A block fed by a stopped parkway is a worse bet than an identical block fed by
+an empty one. That discount is capped on purpose: heavy traffic makes a legal block
+harder, never as bad as an illegal one.
 
-Verify every route: `make smoke`
+**Why a VLM instead of an object detector.** The question is not "how many cars are in
+frame" — a count is meaningless without knowing the camera's zoom and how much road is
+visible. The question is "is traffic into the neighborhood heavy," and a VLM answers
+that directly. It also sees things a box counter structurally cannot: that one
+carriageway is stopped while the other is free-flowing, that it's raining, that a lane
+is closed. `detect.py` keeps a YOLO/Roboflow backend behind the same seam.
 
-```bash
-curl localhost:8080/healthz                                    # {"ok": true}
-curl localhost:8080/api/verdict                                # full JSON
-curl localhost:8080/api/frame/111e79a9-eb5a-44d0-b062-481ac0a81901 -o frame.jpg
-```
+**Why a background refresh.** Four Gemini calls take seconds. Serially they took 24,
+which on stage looks like a crash. They now run concurrently (5.5s) behind a task that
+refreshes every 25s, so requests serve from cache in under a millisecond and a Gemini
+hiccup keeps serving the last good answer instead of an error.
 
-### Run the container locally
+## Data sources
 
-```bash
-docker build -t sheepshead-bay .
-docker run --rm -p 8080:8080 -e PORT=8080 sheepshead-bay
-```
-
-## Deploy to Google Cloud Run
-
-One-time setup:
-
-```bash
-gcloud auth login
-gcloud config set project YOUR_PROJECT_ID
-gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
-```
-
-**Simplest form** — `--source .` builds and deploys in one step. Because a `Dockerfile`
-exists at the repo root, Cloud Build uses it automatically (buildpacks are only used when
-there is no Dockerfile):
-
-```bash
-gcloud run deploy sheepshead-bay \
-  --source . \
-  --region us-east1 \
-  --allow-unauthenticated \
-  --port 8080
-```
-
-**Explicit Dockerfile form** — build the image, then deploy it:
-
-```bash
-gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/sheepshead-bay .
-
-gcloud run deploy sheepshead-bay \
-  --image gcr.io/YOUR_PROJECT_ID/sheepshead-bay \
-  --region us-east1 \
-  --allow-unauthenticated \
-  --port 8080 \
-  --memory 512Mi \
-  --max-instances 5
-```
-
-Or just: `./deploy.sh` (or `make deploy`).
-
-### Flags that matter
-
-| Flag | Why |
+| Source | Use |
 |---|---|
-| `--allow-unauthenticated` | Without it the judges get a 403. Non-negotiable for a public demo. |
-| `--region us-east1` | Keeps latency to the NYC DOT API low. |
-| `--port 8080` | Must match what the container listens on. Cloud Run injects `$PORT`; the Dockerfile honors it and binds `0.0.0.0`. |
-| `--max-instances 5` | Caps spend if the demo gets traffic. |
+| [NYC DOT traffic cameras](https://webcams.nyctmc.org/api/cameras) | 968 cameras; 4 gateways into Sheepshead Bay. Public, no auth |
+| [NYC DOT ASP calendar 2026](https://www.nyc.gov/html/dot/downloads/pdf/asp-calendar-2026.pdf) | The 42 suspension dates. Hardcoded from the PDF — see below |
+| [Parking Regulation Locations and Signs](https://data.cityofnewyork.us/resource/nfid-uabd.json) (`nfid-uabd`) | 6,288 curb signs in the neighborhood, pre-fetched |
 
-Get the URL back any time: `make url`. Tail logs: `make logs`.
+Two things worth knowing if you build on this:
 
-## Configuration
+- **The ASP calendar is not an API.** `api.nyc.gov/public/api/GetCalendar` returns 401
+  without a two-step subscription key. The dates are published once a year as a PDF, so
+  they're a hardcoded constant here: no network call, nothing to fail mid-demo.
+- **`nfid-uabd` has no lat/lon.** Coordinates are NY State Plane Long Island
+  (EPSG:2263, feet). The neighborhood bounding box is expressed in state-plane units in
+  `app/parking.py`.
 
-No secrets in this repo. Everything is read from environment variables.
+## Run it
 
-| Variable | Default | Purpose |
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+echo "GOOGLE_API_KEY=your-key" > .env        # gitignored
+.venv/bin/uvicorn app.main:app --port 8000
+```
+
+Without a key it runs on the stub detector and says so, in the API response and on the
+page. It never silently pretends to be doing computer vision.
+
+| Env var | Default | |
 |---|---|---|
-| `PORT` | `8080` | Injected by Cloud Run. The server binds `0.0.0.0:$PORT`. |
-| `DETECTOR` | `stub` | `stub` = placeholder counts. `zones` = real detector in `traffic/counter.py` (ROI polygons per camera). |
-| `ROBOFLOW_API_KEY` | _unset_ | When set with `DETECTOR=zones`, uses Roboflow hosted inference. Never committed. |
-| `RF_MODEL_ID` | `coco/50` | Model slug for the hosted detector. |
-| `YOLO_WEIGHTS` | `yolo11s.pt` | Local YOLO weights, used when `DETECTOR=zones` and no Roboflow key. |
+| `GOOGLE_API_KEY` | — | Gemini API key. Absent → stub |
+| `DETECTOR` | `gemini` | `gemini` \| `zones` \| `stub` |
+| `REFRESH_SECONDS` | `25` | Background refresh interval |
+| `PORT` | `8080` | Cloud Run injects this |
 
-`DETECTOR=zones` requires the detector's dependencies to be present. They are **not** in this
-service's `requirements.txt` — the base image stays small and the build stays under 10s. If the
-backend can't load, the service degrades to the stub and **says so**: `/api/verdict` reports
-`detector.backend: "stub (requested 'zones', unavailable)"` and `is_stub: true`.
-
-Set them on Cloud Run with `--set-env-vars`, or better, `--set-secrets` from Secret Manager:
+## Deploy
 
 ```bash
-gcloud run services update sheepshead-bay --region us-east1 \
-  --set-env-vars DETECTOR=roboflow \
-  --set-secrets ROBOFLOW_API_KEY=roboflow-key:latest
+gcloud run deploy sheepshead --source . \
+  --region us-east1 --allow-unauthenticated --port 8080 \
+  --set-env-vars GOOGLE_API_KEY=...,DETECTOR=gemini
 ```
 
-## API
+The key is a runtime env var and never enters the image — `.env` is in `.dockerignore`
+as well as `.gitignore`.
 
-| Route | Returns |
+## Routes
+
+| | |
 |---|---|
-| `GET /` | Self-contained HTML demo page. No CDN, inline CSS, auto-refreshes every 5s. |
-| `GET /healthz` | `{"ok": true}` — Cloud Run health check. Never touches upstream. |
-| `GET /api/verdict` | Verdict, per-camera counts, timestamps, camera image URLs. |
-| `GET /api/frame/{camera_id}` | Proxies the live JPEG (avoids browser CORS / mixed-content). |
-| `GET /api/cameras` | Static gateway camera config. |
-| `GET /docs` | OpenAPI docs, free from FastAPI. |
+| `GET /` | The page |
+| `GET /api/parking?address=...` | **The main one.** Ranked block faces near an address |
+| `GET /api/verdict` | Neighborhood conditions, per-camera reads, cache age |
+| `GET /api/history` | Every reading since this instance started |
+| `GET /api/frame/{id}` | Live JPEG proxy |
+| `GET /health` | Cloud Run health |
 
-## Status: what's real, what's stubbed
-
-**Real and working now:**
-- Live NYC DOT camera fetching, concurrent, cached, with stale-frame fallback when upstream flakes.
-- The JPEG proxy, the JSON API, the HTML demo, the health check.
-- NYC parking regulation logic — alternate side, meter hours, time-of-day and weekend effects.
-- The verdict scoring model and phrasing.
-- `_split_by_direction()` in `detect.py` — real geometry logic, already testable; only its input is stubbed.
-
-**Stubbed, clearly marked in code and in the UI:**
-- `detect.count_vehicles()` returns placeholder counts derived from a hash of the frame bytes.
-  They move as the live image changes and are deterministic per frame, but **they are not
-  computer vision.** The API response carries `detector.is_stub: true` and the web UI displays
-  a "Stub detector" badge so nobody mistakes it for real detections.
-
-The seam is deliberately narrow: a real detector drops in behind
-`count_vehicles(jpeg_bytes, inbound_side, camera_id) -> {"inbound", "outbound", "total"}`
-without touching any other file. `_count_via_zones()` is the live adapter onto the real counter
-in `traffic/counter.py` — flip `DETECTOR=zones` and install that detector's deps to switch over.
-
-The stub never lies about itself. `is_stub()` reports the **runtime** truth, not the configured
-intent: if a real backend is requested but fails to load, the API and the UI both still say
-"stub." A demo claiming real detection while serving hashed placeholders would be worse than
-one that admits it.
-
-## License
-
-MIT
+```bash
+curl "https://sheepshead-420329548463.us-east1.run.app/api/parking?address=2650%20E%2014th%20St"
+```
 
 ---
 
-Built for NYC Vision Hack. Data: NYC DOT Traffic Management Center public camera feeds.
+Built at NYC Vision Hack v.2, August 7 2026.

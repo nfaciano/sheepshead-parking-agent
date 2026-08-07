@@ -61,6 +61,33 @@ SEASONAL = re.compile(
     r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{1,2})\s*-\s*"
     r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{1,2})"
 )
+# "2 HMP" (2-Hour Metered Parking), "1 HOUR PARKING", "3 HR PARKING".
+DURATION_LIMIT = re.compile(r"\b(\d+)\s*(?:HMP|HOUR|HR)\b")
+ALL_DAYS = set(range(7))
+
+
+def _restricted_days(d: str) -> set[int]:
+    """Which weekdays a rule actually applies to.
+
+    NYC signs express this two ways and they mean opposite things:
+        "MONDAY THURSDAY 8AM-9:30AM"   -> applies Mon and Thu
+        "8AM-7PM EXCEPT SUNDAY"        -> applies every day BUT Sunday
+
+    Reading the day names out of the second form with a plain regex inverts the
+    rule -- it was reporting "you must move by Sunday 8 AM" for a sign whose whole
+    point is that Sunday is the day it does not apply.
+    """
+    head, sep, tail = d.partition("EXCEPT")
+    named = {DAY_INDEX[x] for x in DAYS.findall(head)}
+
+    if sep:
+        excluded = {DAY_INDEX[x] for x in DAYS.findall(tail)}
+        base = named or ALL_DAYS
+        return base - excluded
+
+    if "ALL DAYS" in d or "EVERY DAY" in d:
+        return set(ALL_DAYS)
+    return named
 
 
 def _time(hour: str, minute: str | None, meridiem: str) -> dt.time:
@@ -98,8 +125,35 @@ def evaluate(sign_description: str, when: dt.datetime) -> dict:
         why = "outside season" if not in_season else "in season but not a restricted day"
         return {"legal": True, "until": None, "reason": f"Legal — {why}"}
 
-    days = {DAY_INDEX[x] for x in DAYS.findall(d)}
+    days = _restricted_days(d)
     window = TIME_RANGE.search(d)
+
+    # "2 HMP 8AM-7PM" is a two-hour metered limit, not a ban. You may park; you
+    # just cannot leave the car all day. Reporting it as a prohibition was wrong,
+    # and reporting it as unrestricted would be equally wrong.
+    limit = DURATION_LIMIT.search(d)
+    if limit and not any(k in d for k in ("NO PARKING", "NO STANDING", "NO STOPPING")):
+        hours = limit.group(1)
+        if days and window and when.weekday() in days:
+            start_t = _time(window.group(1), window.group(2), window.group(3))
+            end_t = _time(window.group(4), window.group(5), window.group(6))
+            if start_t <= when.time() < end_t:
+                return {"legal": True,
+                        "until": dt.datetime.combine(when.date(), end_t),
+                        "reason": f"{hours}-hour limit until {end_t.strftime('%-I:%M %p')}"}
+        return {"legal": True, "until": None,
+                "reason": f"{hours}-hour metered limit, not in effect right now"}
+
+    # "AMBULETTE ONLY", "AUTHORIZED VEHICLES ONLY" -- reserved for someone else.
+    if " ONLY" in d and "PARKING" not in d.split(" ONLY")[0][-12:]:
+        if days and window:
+            start_t = _time(window.group(1), window.group(2), window.group(3))
+            end_t = _time(window.group(4), window.group(5), window.group(6))
+            if when.weekday() in days and start_t <= when.time() < end_t:
+                return {"legal": False,
+                        "until": dt.datetime.combine(when.date(), end_t),
+                        "reason": f"Reserved use until {end_t.strftime('%-I:%M %p')}"}
+
     if not days or not window:
         return {"legal": True, "until": None, "reason": "No parsed restriction (verify the sign)"}
 

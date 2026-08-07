@@ -10,15 +10,20 @@ Runs on Google Cloud Run. Listens on $PORT (default 8080), binds 0.0.0.0.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+from collections import deque
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from . import config  # noqa: F401 - import for side effect: loads .env before detect
+from . import blocks
 from . import detect
+from . import trend
 from .cameras import (
     CAMERAS_BY_ID,
     GATEWAY_CAMERAS,
@@ -28,7 +33,7 @@ from .cameras import (
 )
 from .verdict import NYC_TZ, CameraSignal, build_verdict
 
-APP_TITLE = "Should I Drive to Sheepshead Bay?"
+APP_TITLE = "Which street should I try? — Sheepshead Bay parking"
 
 _client: httpx.AsyncClient | None = None
 
@@ -41,9 +46,13 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         follow_redirects=True,
     )
+    refresher = asyncio.create_task(_refresh_loop())
     try:
         yield
     finally:
+        refresher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await refresher
         await _client.aclose()
         _client = None
 
@@ -62,6 +71,7 @@ def client() -> httpx.AsyncClient:
 # ---------------------------------------------------------------------------
 
 
+@app.get("/health")
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
     """Cloud Run health check. Must never depend on upstream NYC DOT."""
@@ -73,10 +83,37 @@ async def healthz() -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/verdict")
-async def api_verdict() -> JSONResponse:
-    """The verdict, per-camera counts, timestamps, and camera image URLs."""
+async def _compute_verdict() -> dict:
+    """Pull every camera, read each frame, and assemble the full payload.
+
+    The per-camera reads run concurrently. Each Gemini call takes ~5s, so doing four
+    of them in a loop cost 24 seconds -- long enough that a demo audience assumes it
+    crashed. Fanned out, the whole thing is bounded by the slowest single camera.
+    """
     frames = await fetch_all_frames(client())
+
+    # Fan out the vision calls before building the payload. count_vehicles() is
+    # blocking (it makes an HTTPS request), so it goes to a worker thread rather
+    # than stalling the event loop.
+    online = [cam for cam in GATEWAY_CAMERAS if frames.get(cam.id) is not None]
+    reads = await asyncio.gather(
+        *(
+            asyncio.to_thread(
+                detect.count_vehicles,
+                frames[cam.id].jpeg,
+                cam.inbound_side,
+                cam.id,
+            )
+            for cam in online
+        ),
+        return_exceptions=True,
+    )
+    counts_by_id: dict[str, dict] = {}
+    for cam, result in zip(online, reads):
+        if isinstance(result, Exception):
+            # One camera's model call failing must not take down the verdict.
+            continue
+        counts_by_id[cam.id] = result
 
     signals: list[CameraSignal] = []
     cameras_payload: list[dict] = []
@@ -113,11 +150,7 @@ async def api_verdict() -> JSONResponse:
             )
             continue
 
-        counts = detect.count_vehicles(
-            frame.jpeg,
-            inbound_side=cam.inbound_side,
-            camera_id=cam.id,
-        )
+        counts = counts_by_id.get(cam.id) or {"inbound": 0, "outbound": 0, "total": 0}
         signals.append(
             CameraSignal(
                 camera_id=cam.id,
@@ -154,29 +187,197 @@ async def api_verdict() -> JSONResponse:
     now_nyc = datetime.now(NYC_TZ)
     v = build_verdict(signals, now=now_nyc)
 
+    return {
+        "verdict": v.to_dict(),
+        "cameras": cameras_payload,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "generated_at_nyc": now_nyc.isoformat(),
+        "neighborhood": "Sheepshead Bay, Brooklyn, NY",
+        "detector": {
+            "backend": detect.backend_name(),
+            "is_stub": detect.is_stub(),
+            "note": (
+                "Vehicle counts are PLACEHOLDER values derived from the frame "
+                "hash, not computer vision. Swap detect.count_vehicles() for a "
+                "real detector."
+                if detect.is_stub()
+                else "Gemini reads each live frame and reports flow per direction."
+            ),
+        },
+        "privacy": "Vehicle counts only. No license plates, no faces, no frames stored.",
+        "limitation": "This is a demand estimate, not a spot finder.",
+        "source": "NYC DOT Traffic Management Center public cameras (webcams.nyctmc.org)",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cached refresh
+# ---------------------------------------------------------------------------
+#
+# A demo page must feel instant. Computing the verdict costs one round trip to four
+# cameras plus four Gemini calls -- seconds, not milliseconds -- and doing that on
+# the request path means every page load and every auto-refresh stalls.
+#
+# So a background task recomputes on a timer and requests serve the last good
+# payload. The page renders immediately, the numbers are never more than
+# REFRESH_SECONDS stale, and a Gemini hiccup keeps serving the previous answer
+# instead of showing an error on stage.
+
+REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "25"))
+
+_cache: dict = {"payload": None, "at": 0.0}
+_cache_lock = asyncio.Lock()
+
+# Every refresh appends one sample, so the page can show how demand moved over the
+# evening rather than only the current instant. A deque bounds memory without any
+# eviction logic: at 25s per sample, 2,880 samples is 20 hours of history.
+_history: deque = deque(maxlen=2880)
+
+
+async def _refresh_once() -> None:
+    payload = await _compute_verdict()
+    _cache["payload"] = payload
+    _cache["at"] = datetime.now(timezone.utc).timestamp()
+
+    v = payload["verdict"]
+    _history.append({
+        "t": payload["generated_at_nyc"],
+        "score": v["score"],
+        "net_inbound": v["net_inbound"],
+        "total_vehicles": v["total_vehicles"],
+        "recommendation": v["recommendation"],
+        "per_camera": {
+            c["name"]: {
+                "inbound": c["counts"].get("inbound", 0),
+                "outbound": c["counts"].get("outbound", 0),
+            }
+            for c in payload["cameras"] if c["online"]
+        },
+    })
+
+
+async def _refresh_loop() -> None:
+    while True:
+        try:
+            await _refresh_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a bad cycle must not kill the loop
+            print(f"[refresh] cycle failed, serving stale: {exc!r}", flush=True)
+        await asyncio.sleep(REFRESH_SECONDS)
+
+
+@app.get("/api/verdict")
+async def api_verdict() -> JSONResponse:
+    """The verdict, per-camera counts, timestamps, and camera image URLs."""
+    if _cache["payload"] is None:
+        # Cold start: the background loop hasn't produced anything yet. Compute
+        # under a lock so a burst of first requests triggers one pass, not N.
+        async with _cache_lock:
+            if _cache["payload"] is None:
+                await _refresh_once()
+
+    payload = dict(_cache["payload"])
+    age = datetime.now(timezone.utc).timestamp() - _cache["at"]
+    payload["cache"] = {
+        "age_seconds": round(age, 1),
+        "refresh_seconds": REFRESH_SECONDS,
+    }
+    return JSONResponse(payload)
+
+
+@app.get("/api/trend")
+async def api_trend(bucket_minutes: int = 5) -> JSONResponse:
+    """Pressure over the evening: seed file from the tracker plus live samples."""
+    bucket_minutes = max(1, min(bucket_minutes, 60))
     return JSONResponse(
-        {
-            "verdict": v.to_dict(),
-            "cameras": cameras_payload,
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "generated_at_nyc": now_nyc.isoformat(),
-            "neighborhood": "Sheepshead Bay, Brooklyn, NY",
-            "detector": {
-                "backend": detect.backend_name(),
-                "is_stub": detect.is_stub(),
-                "note": (
-                    "Vehicle counts are PLACEHOLDER values derived from the frame "
-                    "hash, not computer vision. Swap detect.count_vehicles() for a "
-                    "real detector."
-                    if detect.is_stub()
-                    else "Live vehicle detection."
-                ),
-            },
-            "privacy": "Vehicle counts only. No license plates, no faces, no frames stored.",
-            "limitation": "This is a demand estimate, not a spot finder.",
-            "source": "NYC DOT Traffic Management Center public cameras (webcams.nyctmc.org)",
-        }
+        await asyncio.to_thread(trend.series, list(_history), bucket_minutes)
     )
+
+
+@app.get("/api/history")
+async def api_history() -> JSONResponse:
+    """Every reading this instance has taken, oldest first.
+
+    In-memory and therefore reset by any redeploy -- scripts/track.py keeps the
+    durable copy on disk. This exists so the page can draw a curve without a
+    database, which is the right amount of machinery for a service that has been
+    running for an hour.
+    """
+    return JSONResponse({
+        "samples": list(_history),
+        "count": len(_history),
+        "note": "In-memory since this instance started; a redeploy resets it.",
+    })
+
+
+@app.get("/api/parking")
+async def api_parking(
+    address: str = "",
+    radius_ft: int = 1200,
+    limit: int = 12,
+    arriving_in: int = 0,
+) -> JSONResponse:
+    """Address -> the block faces around it, ranked by whether you can park there.
+
+    `arriving_in` is minutes from now, and it changes the answers rather than just
+    labelling them. Someone leaving work at 6:20 to get home at 7:00 needs the rules
+    as they will be at 7:00: a block that is illegal until 7 PM is a fine spot when
+    he actually arrives, and a two-hour meter that expires at 7 stops mattering.
+    Evaluating "now" for a trip that happens later is simply the wrong answer.
+    """
+    if not address.strip():
+        return JSONResponse(
+            {"error": "pass ?address=", "example": "/api/parking?address=2650 E 14th St"},
+            status_code=400,
+        )
+
+    radius_ft = max(200, min(radius_ft, 3000))
+    limit = max(1, min(limit, 40))
+    arriving_in = max(0, min(arriving_in, 720))  # up to 12 hours ahead
+    when = datetime.now(NYC_TZ).replace(tzinfo=None) + timedelta(minutes=arriving_in)
+
+    # Hand the live camera reads to the ranker so each block is scored against the
+    # gateway actually feeding it, not one neighborhood-wide average.
+    cached = _cache.get("payload")
+    live_cameras = [
+        {
+            "name": c["name"],
+            "lat": c["latitude"],
+            "lon": c["longitude"],
+            "inbound": c["counts"].get("inbound", 0),
+            "outbound": c["counts"].get("outbound", 0),
+            "congestion_inbound": c["counts"].get("congestion_inbound", ""),
+        }
+        for c in (cached or {}).get("cameras", [])
+        if c.get("online")
+    ]
+
+    try:
+        # Blocking HTTP (geocoder) plus a scan over 1,224 faces -- keep it off the loop.
+        result = await asyncio.to_thread(
+            blocks.lookup,
+            address,
+            when,
+            radius_ft=float(radius_ft),
+            limit=limit,
+            cameras=live_cameras,
+        )
+    except blocks.GeocodeError as exc:
+        return JSONResponse(
+            {"error": "could not locate that address", "detail": str(exc)},
+            status_code=404,
+        )
+
+    # Fold in the neighborhood demand signal, if we have one cached.
+    if cached:
+        result["neighborhood_demand"] = {
+            "headline": cached["verdict"]["headline"],
+            "score": cached["verdict"]["score"],
+            "recommendation": cached["verdict"]["recommendation"],
+        }
+
+    return JSONResponse(result)
 
 
 @app.get("/api/cameras")
@@ -240,7 +441,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Should I Drive to Sheepshead Bay?</title>
+<title>Which street should I try? — Sheepshead Bay parking</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F697;</text></svg>">
 <style>
   :root {
@@ -293,6 +494,84 @@ INDEX_HTML = """<!doctype html>
     margin: 0 0 12px;
   }
   .verdict-sub { font-size: 17px; color: #cdd3dd; max-width: 62ch; margin: 0 0 22px; }
+  .lookup { margin: 18px 0; }
+  .lookup.hero { padding: 24px; border-color: #2f3c52; background: #121a26; }
+  .lookup.hero .addr-row input { font-size: 19px; padding: 15px 16px; }
+  .lookup.hero .addr-row button { font-size: 16px; padding: 15px 24px; }
+  .addr-row select {
+    flex: 0 0 auto; padding: 15px 12px; font-size: 15px; border-radius: 10px;
+    border: 1px solid #2a3342; background: #0f1520; color: #e8ecf3;
+  }
+  .top-pick {
+    margin-top: 18px; padding: 20px 22px; border-radius: 12px;
+    background: linear-gradient(180deg, #16281d 0%, #12211a 100%);
+    border: 1px solid #2c5138;
+  }
+  .top-label {
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+    color: #6ee7a0; font-weight: 700; margin-bottom: 8px;
+  }
+  .top-street { font-size: 26px; font-weight: 700; line-height: 1.15; }
+  .top-between { color: var(--muted); font-size: 14px; margin-top: 3px; }
+  .top-why { font-size: 15px; color: #dfe6ef; margin-top: 10px; }
+  .top-meta {
+    display: flex; gap: 20px; flex-wrap: wrap; margin-top: 12px;
+    font-size: 13px; color: var(--muted);
+  }
+  .trend-wrap { margin-top: 20px; border-top: 1px solid #1e2532; padding-top: 16px; }
+  .trend-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; flex-wrap: wrap; margin-bottom: 10px;
+  }
+  .trend-title {
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted);
+  }
+  .trend-verdict { font-size: 14px; color: #dfe6ef; }
+  .trend-note { font-size: 11px; color: var(--muted); margin-top: 8px; max-width: 78ch; }
+  .faces-label {
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--muted); margin: 22px 0 4px;
+  }
+  .conditions-label {
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px;
+  }
+  .lookup-hint { color: var(--muted); font-size: 14px; margin: 0 0 14px; max-width: 68ch; }
+  .addr-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .addr-row input {
+    flex: 1 1 260px; padding: 12px 14px; font-size: 16px; border-radius: 10px;
+    border: 1px solid #2a3342; background: #0f1520; color: #e8ecf3;
+  }
+  .addr-row input:focus { outline: 2px solid var(--accent, #6aa9ff); outline-offset: 1px; }
+  .addr-row button {
+    padding: 12px 20px; font-size: 15px; font-weight: 600; border-radius: 10px;
+    border: 0; background: #6aa9ff; color: #06101f; cursor: pointer;
+  }
+  .addr-row button:disabled { opacity: .55; cursor: default; }
+  .addr-status { color: var(--muted); font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .face {
+    display: flex; gap: 14px; align-items: baseline; padding: 12px 0;
+    border-bottom: 1px solid #1e2532;
+  }
+  .face:last-child { border-bottom: 0; }
+  .pill {
+    flex: 0 0 auto; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+    text-transform: uppercase; padding: 4px 9px; border-radius: 999px;
+  }
+  .pill.good  { background: #15351f; color: #6ee7a0; }
+  .pill.fair  { background: #3a3216; color: #f5d67b; }
+  .pill.tight { background: #3a2a16; color: #f0b37b; }
+  .pill.no    { background: #3a1b1b; color: #ff9d9d; }
+  .face-main { flex: 1 1 auto; min-width: 0; }
+  .face-street { font-weight: 600; font-size: 15px; }
+  .face-where { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .face-why { font-size: 13px; margin-top: 4px; color: #cdd3dd; }
+  .face-feed { font-size: 12px; margin-top: 3px; color: var(--muted); }
+  .face-dist { flex: 0 0 auto; color: var(--muted); font-size: 13px; text-align: right; }
+  @media (max-width: 620px) {
+    .face { flex-wrap: wrap; }
+    .face-dist { text-align: left; }
+  }
 
   .stats { display: flex; flex-wrap: wrap; gap: 34px; padding-top: 20px;
            border-top: 1px solid var(--line); }
@@ -382,15 +661,34 @@ INDEX_HTML = """<!doctype html>
 <div class="wrap">
 
   <header>
-    <div class="eyebrow">NYC Vision Hack &middot; live NYC DOT traffic cameras</div>
-    <h1>Should I Drive to Sheepshead Bay?</h1>
+    <div class="eyebrow">NYC Vision Hack &middot; Sheepshead Bay, Brooklyn</div>
+    <h1>Which street should I try?</h1>
     <div class="sub">
-      Counting vehicles on the four roads into the neighborhood, right now.
+      Type where you're headed. We rank the blocks around it by where you're most
+      likely to actually find a legal spot &mdash; so you stop circling.
       <span class="live"><span class="dot"></span><span id="tick">connecting&hellip;</span></span>
     </div>
   </header>
 
+  <section class="card lookup hero">
+    <form id="addr-form" class="addr-row" autocomplete="off">
+      <input id="addr" type="text" placeholder="2650 E 14th St" aria-label="Address" />
+      <select id="arriving" aria-label="When are you arriving">
+        <option value="0">arriving now</option>
+        <option value="15">in 15 min</option>
+        <option value="30">in 30 min</option>
+        <option value="60">in 1 hour</option>
+        <option value="120">in 2 hours</option>
+      </select>
+      <button type="submit">Find me a block</button>
+    </form>
+    <div id="addr-status" class="addr-status"></div>
+    <div id="top-pick"></div>
+    <div id="faces"></div>
+  </section>
+
   <section class="verdict">
+    <div class="conditions-label">Conditions right now &mdash; these apply to every block above</div>
     <h2 class="verdict-head" id="headline">Reading the cameras&hellip;</h2>
     <p class="verdict-sub" id="subtext">Pulling live frames from the NYC DOT Traffic Management Center.</p>
     <div class="stats">
@@ -403,8 +701,8 @@ INDEX_HTML = """<!doctype html>
         <div class="stat-val" id="net">--</div>
       </div>
       <div>
-        <div class="stat-label">Vehicles in frame</div>
-        <div class="stat-val" id="total">--</div>
+        <div class="stat-label">Trend</div>
+        <div class="stat-val" id="trend">--</div>
       </div>
       <div>
         <div class="stat-label">Cameras live</div>
@@ -412,6 +710,7 @@ INDEX_HTML = """<!doctype html>
       </div>
     </div>
     <div id="stub-flag"></div>
+    <div id="trend-chart" class="trend-wrap"></div>
   </section>
 
   <div class="cols">
@@ -491,9 +790,10 @@ async function refresh() {
     document.getElementById("score").textContent = Math.round(v.score);
     document.getElementById("net").textContent =
       (v.net_inbound > 0 ? "+" : "") + v.net_inbound;
-    document.getElementById("total").textContent = v.total_vehicles;
     document.getElementById("live-cams").textContent =
       v.cameras_reporting + "/" + d.cameras.length;
+    updateTrend();
+    drawTrendChart();
 
     document.getElementById("reasons").innerHTML =
       v.reasons.map(x => `<li>${esc(x)}</li>`).join("");
@@ -513,6 +813,207 @@ async function refresh() {
     document.getElementById("tick").textContent = "reconnecting\\u2026";
   }
 }
+
+// --- Trend: is the neighborhood filling up or emptying out? ---
+//
+// One instant reading cannot tell you whether to hurry. The direction of travel
+// over the last stretch can: pressure climbing means go now, falling means the
+// curb is opening up.
+
+let trendState = { label: "—", detail: "" };
+
+// Inline SVG rather than a chart library: no CDN, no build step, and the whole
+// thing is a dozen rects. Bars are net inbound per window -- above the zero line
+// means more cars arriving than leaving.
+async function drawTrendChart() {
+  const el = document.getElementById("trend-chart");
+  if (!el) return;
+  try {
+    const r = await fetch("/api/trend", { cache: "no-store" });
+    const d = await r.json();
+    const b = d.buckets || [];
+    if (b.length < 2) { el.innerHTML = ""; return; }
+
+    const W = 100, H = 34, gap = 0.6;
+    const vals = b.map(x => x.net_inbound);
+    const peak = Math.max(4, ...vals.map(Math.abs));
+    const bw = W / b.length;
+
+    const bars = b.map(function (x, i) {
+      const h = Math.abs(x.net_inbound) / peak * (H / 2);
+      const up = x.net_inbound >= 0;
+      const y = up ? (H / 2 - h) : (H / 2);
+      const fill = up ? "#ff8f6b" : "#6ee7a0";
+      return '<rect x="' + (i * bw + gap).toFixed(2) + '" y="' + y.toFixed(2) +
+             '" width="' + (bw - gap * 2).toFixed(2) + '" height="' + Math.max(h, 0.6).toFixed(2) +
+             '" fill="' + fill + '" opacity="0.9"><title>' +
+             esc(x.label) + ' — net ' + (x.net_inbound > 0 ? "+" : "") + x.net_inbound +
+             ' (' + x.readings + ' readings)</title></rect>';
+    }).join("");
+
+    const s = d.summary || {};
+    el.innerHTML =
+      '<div class="trend-head">' +
+        '<span class="trend-title">Pressure since we started watching</span>' +
+        '<span class="trend-verdict">' +
+          esc(s.from_label || "") + ' → ' + esc(s.to_label || "") + ': <strong>' +
+          esc(s.direction || "—") + '</strong>' +
+          (s.readings ? ' · ' + esc(String(s.readings)) + ' readings' : '') +
+        '</span>' +
+      '</div>' +
+      '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" ' +
+        'style="width:100%;height:56px;display:block">' +
+        '<line x1="0" y1="' + (H / 2) + '" x2="' + W + '" y2="' + (H / 2) +
+          '" stroke="#2a3342" stroke-width="0.3"/>' +
+        bars +
+      '</svg>' +
+      '<div class="trend-note">' + esc(d.measures || "") + '</div>';
+  } catch (e) {
+    // A missing chart must never break the page.
+  }
+}
+
+async function updateTrend() {
+  try {
+    const r = await fetch("/api/history", { cache: "no-store" });
+    const d = await r.json();
+    const s = d.samples || [];
+    const el = document.getElementById("trend");
+
+    if (s.length < 4) {
+      el.textContent = "—";
+      el.title = "Building history (" + s.length + " readings so far)";
+      return;
+    }
+
+    // Compare the most recent quarter against the oldest quarter.
+    const n = Math.max(2, Math.floor(s.length / 4));
+    const avg = a => a.reduce((x, y) => x + y.score, 0) / a.length;
+    const early = avg(s.slice(0, n));
+    const late  = avg(s.slice(-n));
+    const delta = late - early;
+
+    let label;
+    if (delta > 4)       label = "↑ filling";
+    else if (delta < -4) label = "↓ easing";
+    else                 label = "→ steady";
+
+    el.textContent = label;
+    el.title = "Pressure " + (delta >= 0 ? "+" : "") + delta.toFixed(1) +
+               " over " + s.length + " readings";
+    trendState = { label: label, detail: el.title };
+  } catch (e) {
+    // A missing trend must never break the page.
+  }
+}
+
+// --- Address lookup: which block faces near me can I actually park on? ---
+
+const addrForm   = document.getElementById("addr-form");
+const addrInput  = document.getElementById("addr");
+const addrStatus = document.getElementById("addr-status");
+const facesEl    = document.getElementById("faces");
+
+function renderFaces(d) {
+  const topEl = document.getElementById("top-pick");
+  topEl.innerHTML = "";
+
+  if (!d.in_coverage) {
+    facesEl.innerHTML = "";
+    addrStatus.textContent = d.coverage_note || "Outside the covered area.";
+    return;
+  }
+  if (!d.block_faces.length) {
+    facesEl.innerHTML = "";
+    addrStatus.textContent = "No block faces with posted signs within range. Try a wider radius.";
+    return;
+  }
+
+  const rec = d.recommendation;
+  if (rec) {
+    topEl.innerHTML =
+      '<div class="top-pick">' +
+        '<div class="top-label">Go here first</div>' +
+        '<div class="top-street">' + esc(rec.street) + ' — ' + esc(rec.side) + '</div>' +
+        '<div class="top-between">' + esc(rec.between || "") + '</div>' +
+        '<div class="top-why">' + esc(rec.why) + '</div>' +
+        '<div class="top-meta">' +
+          '<span><strong>' + esc(String(rec.walk_minutes)) + ' min</strong> walk · ' +
+            esc(String(rec.distance_ft)) + ' ft</span>' +
+          (rec.backup ? '<span>Backup: ' + esc(rec.backup) + '</span>' : '') +
+        '</div>' +
+      '</div>';
+  }
+
+  const asp = d.asp || {};
+  const aspLine = asp.in_effect
+    ? "Alternate side is in effect — next sweep " + esc(asp.next_sweep_human || "soon") +
+      ", so those block faces will churn."
+    : "Alternate side is SUSPENDED (" + esc(asp.suspended_reason || "holiday") +
+      ") — nobody has to move, so the curb stays as full as it is.";
+
+  addrStatus.innerHTML =
+    "Matched <strong>" + esc(d.location.matched) + "</strong> via " + esc(d.location.source) +
+    ". " + aspLine;
+
+  facesEl.innerHTML = '<div class="faces-label">Backups, in order</div>' +
+    d.block_faces.slice(1).map(function (b) {
+    const when = b.legal_now
+      ? (b.until_human ? "until " + esc(b.until_human) : "no posted limit")
+      : "not now";
+    const f = b.feeder_camera;
+    const feedLine = f
+      ? '<div class="face-feed">Traffic in via ' + esc(f.camera) +
+        ' &mdash; <strong>' + esc(f.congestion_inbound) + '</strong>' +
+        (f.pressure > 0.05 ? ' (competition for this block)' : ' (little competition)') +
+        '</div>'
+      : "";
+    return '' +
+      '<div class="face">' +
+        '<span class="pill ' + esc(b.confidence) + '">' + esc(b.confidence) + '</span>' +
+        '<div class="face-main">' +
+          '<div class="face-street">' + esc(b.street) + ' — ' + esc(b.side) + '</div>' +
+          '<div class="face-where">' + esc(b.between || "") + '</div>' +
+          '<div class="face-why">' + esc(b.reason) + '</div>' +
+          feedLine +
+        '</div>' +
+        '<div class="face-dist">' +
+          esc(String(b.walk_minutes)) + ' min walk<br>' +
+          '<span style="opacity:.7">' + esc(String(b.distance_ft)) + ' ft · ' + when + '</span>' +
+        '</div>' +
+      '</div>';
+  }).join("");
+}
+
+async function lookupAddress(ev) {
+  if (ev) ev.preventDefault();
+  const address = addrInput.value.trim();
+  if (!address) return;
+
+  const button = addrForm.querySelector("button");
+  button.disabled = true;
+  addrStatus.textContent = "Locating …";
+  facesEl.innerHTML = "";
+
+  try {
+    const mins = document.getElementById("arriving").value || "0";
+    const r = await fetch(
+      "/api/parking?address=" + encodeURIComponent(address) + "&arriving_in=" + mins,
+      { cache: "no-store" });
+    const d = await r.json();
+    if (!r.ok) {
+      addrStatus.textContent = d.error || "Could not look that up.";
+      return;
+    }
+    renderFaces(d);
+  } catch (e) {
+    addrStatus.textContent = "Lookup failed: " + e.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+addrForm.addEventListener("submit", lookupAddress);
 
 refresh();
 setInterval(refresh, 5000);

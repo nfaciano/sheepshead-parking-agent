@@ -11,6 +11,7 @@ The regulation logic (alternate side parking, meter hours) is real NYC rules.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -133,18 +134,27 @@ def regulation_notes(now: datetime) -> tuple[list[str], float]:
         multiplier *= 0.95
 
     # --- Residential occupancy by time of day ---
-    if 18 <= hour < 23:
-        notes.append("Evening: residents are home and parked. Curb occupancy is at its daily peak.")
-        multiplier *= 1.25
-    elif 23 <= hour or hour < 6:
-        notes.append("Overnight: the curb is full but nobody is competing for it — expect a long crawl.")
-        multiplier *= 1.15
-    elif 6 <= hour < 10:
+    # The evening fill-up is the daily peak: everyone who left in the morning comes
+    # back, and nobody leaves again until tomorrow. The window from about 4 PM is
+    # when the curb is actively closing, which is worse than when it is simply full.
+    if 6 <= hour < 10:
         notes.append("Morning: commuters are leaving, spots are opening up.")
         multiplier *= 0.80
-    else:
+    elif 10 <= hour < 16:
         notes.append("Midday: moderate turnover on the residential blocks.")
         multiplier *= 0.95
+    elif 16 <= hour < 19:
+        notes.append(
+            "Late afternoon: residents are arriving home and the curb is filling. "
+            "This is the worst stretch of the day to start looking."
+        )
+        multiplier *= 1.30
+    elif 19 <= hour < 23:
+        notes.append("Evening: residents are home and parked. Curb occupancy is at its daily peak.")
+        multiplier *= 1.25
+    else:
+        notes.append("Overnight: the curb is full but nobody is competing for it — expect a long crawl.")
+        multiplier *= 1.15
 
     # --- Weekend beach/boardwalk effect ---
     if weekday >= 5 and 10 <= hour < 19:
@@ -200,8 +210,16 @@ def build_verdict(
     per_camera_net = weighted_pressure / max(len(reporting), 1)
     direction_score = max(min(per_camera_net / 4.0, 1.0), -1.0) * 25.0
 
-    raw = 45.0 + volume_score * 0.6 + direction_score
-    score = max(0.0, min(100.0, raw * reg_multiplier))
+    raw = 30.0 + volume_score * 0.6 + direction_score
+    adjusted = raw * reg_multiplier
+
+    # Squash into 0-100 instead of clipping. A hard clamp saturated at exactly
+    # 100.0 on an ordinary Friday evening, which is both useless (no dynamic range
+    # left to show a genuinely bad night) and not credible -- a score of "100, the
+    # worst possible" while the cameras read "moderate" invites the obvious
+    # question. tanh keeps the mid-range roughly linear and compresses the tail, so
+    # the number approaches 100 without ever claiming to have reached it.
+    score = 100.0 * math.tanh(max(adjusted, 0.0) / 62.0)
 
     reasons: list[str] = []
     reasons.append(
