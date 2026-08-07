@@ -19,12 +19,23 @@ COPY app ./app
 # function without, not an optional asset.
 COPY data/sheepshead_signs.json ./data/sheepshead_signs.json
 
+# 311 illegal-parking complaints, snapped to block faces. Without it every block
+# reports "no complaint history" -- which looks like the neighborhood is quiet
+# rather than like the file is missing. Same silent-empty failure as the sign data.
+COPY data/illegal_parking_311.json ./data/illegal_parking_311.json
+
 # Readings taken before this deploy, so the trend chart shows the whole evening
 # rather than restarting from zero every time we ship. Optional -- the app works
 # without it, it just has a shorter history.
 COPY data/history.jsonl ./data/history.jsonl
 
 # Cloud Run injects $PORT (8080 by default) and requires binding 0.0.0.0.
+# Cloud Run containers default to UTC. Every time in this app is compared against
+# posted NYC parking signs, which are New York wall-clock, so the container runs on
+# New York time and any naive datetime is correct by construction. tzdata is already
+# a dependency because python:3.12-slim ships no IANA database.
+ENV TZ=America/New_York
+
 ENV PORT=8080
 EXPOSE 8080
 

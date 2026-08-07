@@ -83,6 +83,30 @@ So the same traffic reading produces opposite answers:
 That inversion is the whole point of the project. It is also the part a traffic
 dashboard cannot tell you.
 
+## Ask it in plain English
+
+```
+"I get home to 1822 Avenue X in an hour, where should I park?"
+
+  → Try the north side of Avenue X between East 18th and East 19th Street.
+    Legal until Monday 11:30 AM. About 90 feet to the middle of that stretch,
+    roughly 8 cars fit on it.
+    311 shows very few complaints on this block face compared to the surrounding
+    streets, so it's a quieter stretch to check.
+
+  tools used: find_parking
+```
+
+Gemini gets the tool definitions and decides what to call. It resolves "in an hour"
+to an arrival time, looks the blocks up *at that time*, and writes the answer. The
+tools it can reach are `find_parking`, `check_alternate_side`, and
+`get_traffic_conditions`; every response lists which ones ran, because a parking
+recommendation you cannot audit is worth very little.
+
+Hard-coding that chain would answer one question. Letting the model plan over the
+tools answers ones nobody wrote a form for — *"is it worth waiting an hour?"*,
+*"what about next Saturday?"*, *"which side of the street?"*
+
 ## Architecture
 
 ```

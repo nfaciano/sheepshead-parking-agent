@@ -246,7 +246,7 @@ def build_verdict(
             f"{len(signals) - len(reporting)} camera(s) offline — confidence reduced."
         )
 
-    headline, subtext, recommendation = _phrase(score, now)
+    headline, subtext, recommendation = _phrase(score, now, net_inbound)
 
     return Verdict(
         headline=headline,
@@ -261,41 +261,61 @@ def build_verdict(
     )
 
 
-def _phrase(score: float, now: datetime) -> tuple[str, str, str]:
-    """Map a 0-100 difficulty score to a plain-English answer."""
+def _phrase(score: float, now: datetime, net_inbound: int = 0) -> tuple[str, str, str]:
+    """Map a 0-100 difficulty score to a plain-English answer.
+
+    The traffic clause is derived from `net_inbound` rather than assumed from the
+    score. Those two can genuinely disagree -- on a weekday evening the score is high
+    because residents are home and the curb is full, even while the gateways are
+    draining -- and an earlier version hardcoded "cars are pouring in" into the
+    high-score band, so the headline could claim inbound traffic while the panel
+    directly below it reported the opposite. Say what the number actually says.
+    """
     when = now.strftime("%-I:%M %p")
 
+    if net_inbound > 2:
+        flow = "cars are still heading in faster than they're leaving"
+    elif net_inbound < -2:
+        flow = "the gateways are draining, so the curb should loosen up over the next hour"
+    else:
+        flow = "traffic in and out is about even"
+
+    # These describe how hard the search will be tonight. They are NOT a verdict on
+    # whether to come -- the block list above already answers that, block by block.
+    # Phrasing this as "no, don't bother" put a red refusal directly above a list of
+    # blocks rated good, which reads as the page disagreeing with itself. It never
+    # was: one is neighbourhood difficulty, the other is where the legal curb is.
     if score < 30:
         return (
-            "Yes — go now.",
-            f"As of {when} the roads in are quiet and more cars are leaving than arriving. "
-            f"This is about as good as it gets. Expect a short loop.",
+            "Quiet night.",
+            f"As of {when} the roads in are quiet and {flow}. About as easy as this "
+            f"neighbourhood gets — the blocks above should come easily.",
             "go",
         )
     if score < 50:
         return (
-            "Yes, probably.",
-            f"As of {when} inbound traffic is moderate. You should find something within "
-            f"a few blocks. Bring patience, not a lot of it.",
+            "Normal night.",
+            f"As of {when} {flow}. Expect to find something on one of the first blocks "
+            f"listed above.",
             "go",
         )
     if score < 68:
         return (
-            "Toss-up.",
-            f"As of {when} demand is real but not brutal. Budget 10-15 minutes of "
-            f"circling and widen your radius past Emmons Ave.",
+            "Busy night.",
+            f"As of {when} demand is real but not brutal, and {flow}. Work down the "
+            f"list above rather than fixating on the closest block.",
             "maybe",
         )
     if score < 82:
         return (
-            "Not great.",
-            f"As of {when} cars are pouring in faster than they're leaving. Expect a long "
-            f"crawl. If you can push it an hour, do that.",
+            "Hard night.",
+            f"As of {when} the curb is near its daily peak — {flow}. The blocks above "
+            f"are still your best odds, but budget a few laps.",
             "avoid",
         )
     return (
-        "No — don't bother.",
-        f"As of {when} every gateway is loaded and inbound flow is heavy. You will circle. "
-        f"Take the B/Q or park north of Kings Hwy and walk.",
+        "Brutal night.",
+        f"As of {when} every gateway is loaded and {flow}. Start at the longest "
+        f"stretch on the list above, not the nearest one, and give it time.",
         "avoid",
     )

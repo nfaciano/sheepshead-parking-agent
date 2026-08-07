@@ -17,15 +17,30 @@ camera-derived demand estimate applied to the whole neighborhood.
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import datetime as dt
 import functools
 import math
 import re
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
-from . import parking
+from . import parking, pressure
+
+NYC = ZoneInfo("America/New_York")
+
+
+def now_nyc() -> dt.datetime:
+    """Naive New York wall-clock time.
+
+    Posted parking signs are written in local time, so every comparison in this module
+    has to be against local time. A bare datetime.now() picks up the container clock,
+    which on Cloud Run is UTC -- correct on a laptop in New York, four hours wrong in
+    production.
+    """
+    return dt.datetime.now(NYC).replace(tzinfo=None)
 
 # Lat/lon -> NY State Plane Long Island (EPSG:2263, feet). Fitted against the 311
 # dataset, which publishes both coordinate systems; residuals under half a foot,
@@ -62,66 +77,103 @@ SIDE_NAMES = {
 }
 
 
+def _geocode_census(query: str) -> dict:
+    r = requests.get(
+        "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
+        params={"address": query, "benchmark": "Public_AR_Current", "format": "json"},
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    matches = r.json()["result"]["addressMatches"]
+    if not matches:
+        raise GeocodeError("census: no match")
+    m = matches[0]
+    return {
+        "lat": float(m["coordinates"]["y"]),
+        "lon": float(m["coordinates"]["x"]),
+        "matched": m["matchedAddress"],
+        "source": "US Census Geocoder",
+    }
+
+
+def _geocode_planninglabs(query: str) -> dict:
+    r = requests.get(
+        "https://geosearch.planninglabs.nyc/v2/search",
+        params={"text": query, "size": 1},
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    features = r.json().get("features") or []
+    if not features:
+        raise GeocodeError("planninglabs: no match")
+    f = features[0]
+    lon, lat = f["geometry"]["coordinates"]
+    return {
+        "lat": float(lat),
+        "lon": float(lon),
+        "matched": f["properties"].get("label", query),
+        "source": "NYC Planning GeoSearch",
+    }
+
+
+def _in_neighborhood(hit: dict) -> bool:
+    return (
+        NEIGHBORHOOD_BBOX["lat"][0] <= hit["lat"] <= NEIGHBORHOOD_BBOX["lat"][1]
+        and NEIGHBORHOOD_BBOX["lon"][0] <= hit["lon"] <= NEIGHBORHOOD_BBOX["lon"][1]
+    )
+
+
 def geocode(address: str) -> dict:
-    """Address -> {lat, lon, matched, source}. Tries each geocoder in turn."""
+    """Address -> {lat, lon, matched, source}.
+
+    Both geocoders are queried at once rather than in turn. Running them in sequence
+    meant that anything the Census geocoder could not resolve -- "Emmons Ave" with no
+    house number, a bare zip, a neighbourhood name -- paid its full round trip before
+    the NYC-specific one was even tried, so the loosest queries were the slowest.
+    Concurrently, the cost of any lookup is the slower of the two, not the sum.
+
+    Where they disagree, prefer the one that landed in the neighbourhood: the national
+    geocoder will cheerfully resolve "Manhattan" to Montana, while NYC's own service
+    understands a partial New York street name.
+    """
     address = (address or "").strip()
     if not address:
         raise GeocodeError("empty address")
 
-    # Nudge bare street numbers toward the right neighborhood.
     query = address
     if "brooklyn" not in query.lower() and ", ny" not in query.lower():
         query = f"{query}, Brooklyn, NY"
 
-    errors = []
+    hits: list[dict] = []
+    errors: list[str] = []
 
-    for source in GEOCODERS:
-        try:
-            if source == "census":
-                r = requests.get(
-                    "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
-                    params={
-                        "address": query,
-                        "benchmark": "Public_AR_Current",
-                        "format": "json",
-                    },
-                    timeout=TIMEOUT,
-                )
-                r.raise_for_status()
-                matches = r.json()["result"]["addressMatches"]
-                if not matches:
-                    errors.append("census: no match")
-                    continue
-                m = matches[0]
-                return {
-                    "lat": float(m["coordinates"]["y"]),
-                    "lon": float(m["coordinates"]["x"]),
-                    "matched": m["matchedAddress"],
-                    "source": "US Census Geocoder",
-                }
-
-            r = requests.get(
-                "https://geosearch.planninglabs.nyc/v2/search",
-                params={"text": query, "size": 1},
-                timeout=TIMEOUT,
-            )
-            r.raise_for_status()
-            features = r.json().get("features") or []
-            if not features:
-                errors.append("planninglabs: no match")
+    pool = cf.ThreadPoolExecutor(max_workers=2)
+    try:
+        futures = {
+            pool.submit(_geocode_census, query): "census",
+            pool.submit(_geocode_planninglabs, query): "planninglabs",
+        }
+        for future in cf.as_completed(futures, timeout=TIMEOUT + 3):
+            try:
+                hit = future.result()
+            except Exception as exc:  # noqa: BLE001 - one failing is expected
+                errors.append(f"{futures[future]}: {exc}")
                 continue
-            f = features[0]
-            lon, lat = f["geometry"]["coordinates"]
-            return {
-                "lat": float(lat),
-                "lon": float(lon),
-                "matched": f["properties"].get("label", query),
-                "source": "NYC Planning GeoSearch",
-            }
-        except Exception as exc:  # noqa: BLE001 - try the next geocoder
-            errors.append(f"{source}: {exc}")
+            # First answer that lands in the neighbourhood wins. Waiting for the
+            # other one cannot improve it and costs the caller the slower round trip.
+            if _in_neighborhood(hit):
+                return hit
+            hits.append(hit)
+    finally:
+        # Don't block on the loser; its result is no longer wanted.
+        pool.shutdown(wait=False, cancel_futures=True)
 
-    raise GeocodeError("; ".join(errors) or "no geocoder available")
+    if not hits:
+        raise GeocodeError("; ".join(errors) or "no geocoder available")
+
+    # Nothing landed in the neighbourhood. Return a hit anyway so the caller can say
+    # "that address is outside Sheepshead Bay" rather than "I could not find it".
+    return hits[0]
 
 
 @functools.lru_cache(maxsize=1)
@@ -169,12 +221,38 @@ def _block_faces() -> list[dict]:
 
     faces = []
     for face in grouped.values():
-        face["x"] = sum(face["_xs"]) / len(face["_xs"])
-        face["y"] = sum(face["_ys"]) / len(face["_ys"])
-        face["sign_count"] = len(face["_xs"])
+        xs, ys = face["_xs"], face["_ys"]
+        face["x"] = sum(xs) / len(xs)
+        face["y"] = sum(ys) / len(ys)
+        face["sign_count"] = len(xs)
+        # Distance between the two furthest-apart signs on this face: a lower bound
+        # on the block's length, used to estimate how many cars it holds.
+        face["span_ft"] = (
+            math.hypot(max(xs) - min(xs), max(ys) - min(ys)) if len(xs) > 1 else 0.0
+        )
         del face["_xs"], face["_ys"]
         faces.append(face)
     return faces
+
+
+SPACE_LENGTH_FT = 22.0  # a parallel-parking space plus the gap you leave
+
+
+def _approx_spaces(face: dict) -> Optional[int]:
+    """Roughly how many cars fit along this block face.
+
+    Estimated from how far apart its own signs are: DOT posts signs along the length
+    of a regulated stretch, so the spread between the outermost signs is a floor on
+    the block's length. It is a floor, not a measurement -- a face with one sign gives
+    us nothing, and we return None rather than guess.
+
+    Turning "try Avenue X south side" into "about 30 spaces on that stretch" is the
+    difference between a street name and a place you can picture.
+    """
+    span = face.get("span_ft")
+    if not span or span < SPACE_LENGTH_FT:
+        return None
+    return max(1, int(span / SPACE_LENGTH_FT))
 
 
 def _evaluate_face(face: dict, when: dt.datetime) -> dict:
@@ -315,7 +393,7 @@ def nearby(
     cameras: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Block faces within `radius_ft`, best bets first."""
-    when = when or dt.datetime.now()
+    when = when or now_nyc()
     ox, oy = to_state_plane(lat, lon)
 
     results = []
@@ -360,6 +438,20 @@ def nearby(
             "signs_posted": face["sign_count"],
             "rules": face["rules"][:3],
             "feeder_camera": feed,
+            # How contested this block actually is, from 311 illegal-parking
+            # complaints snapped to it. Unlike the cameras, this covers every block
+            # in the neighborhood and is about parking rather than through-traffic.
+            "pressure": pressure.for_block(
+                face["on_street"], face["from_street"], face["to_street"], face["side"]
+            ),
+            # Roughly how many cars the stretch holds, so "try this block" has a size.
+            "approx_spaces": _approx_spaces(face),
+            # Offsets in feet from the queried address, east and north positive.
+            # State plane is already a flat grid in feet, so this is a plain
+            # subtraction -- no projection maths needed on the client, and the map
+            # can be drawn without a tile server or any external library.
+            "dx_ft": int(face["x"] - ox),
+            "dy_ft": int(face["y"] - oy),
         })
 
     # Legal first, then the longest window, then closest.
@@ -369,7 +461,7 @@ def nearby(
 
 def lookup(address: str, when: Optional[dt.datetime] = None, **kwargs) -> dict:
     """Geocode, then rank the block faces around it."""
-    when = when or dt.datetime.now()
+    when = when or now_nyc()
     location = geocode(address)
 
     in_area = (

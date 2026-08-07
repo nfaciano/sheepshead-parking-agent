@@ -21,6 +21,7 @@ from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import config  # noqa: F401 - import for side effect: loads .env before detect
+from . import agent
 from . import blocks
 from . import detect
 from . import trend
@@ -58,6 +59,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=APP_TITLE, lifespan=lifespan, docs_url="/docs")
+
+# The agent reuses the background refresh's camera reading rather than pulling
+# four fresh frames per question -- same data, no added latency on the ask path.
+agent.set_conditions_provider(lambda: _cache.get("payload"))
 
 
 def client() -> httpx.AsyncClient:
@@ -284,6 +289,21 @@ async def api_verdict() -> JSONResponse:
         "refresh_seconds": REFRESH_SECONDS,
     }
     return JSONResponse(payload)
+
+
+@app.get("/api/ask")
+async def api_ask(q: str = "") -> JSONResponse:
+    """Ask in plain English. The agent picks its tools and writes the answer."""
+    if not q.strip():
+        return JSONResponse(
+            {"error": "pass ?q=", "example": "/api/ask?q=I get home around 7, where do I park?"},
+            status_code=400,
+        )
+    try:
+        # The whole loop is blocking HTTP; keep it off the event loop.
+        return JSONResponse(await asyncio.to_thread(agent.ask, q))
+    except agent.AgentUnavailable as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
 
 
 @app.get("/api/trend")
@@ -528,6 +548,45 @@ INDEX_HTML = """<!doctype html>
   }
   .trend-verdict { font-size: 14px; color: #dfe6ef; }
   .trend-note { font-size: 11px; color: var(--muted); margin-top: 8px; max-width: 78ch; }
+  .ask-examples { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .chip {
+    font-size: 12px; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+    border: 1px solid #2a3342; background: #0f1520; color: #9fb0c6;
+  }
+  .chip:hover { border-color: #6aa9ff; color: #cfe0ff; }
+  .ask-answer {
+    margin-top: 18px; padding: 20px 22px; border-radius: 12px;
+    background: #101827; border: 1px solid #24304a; line-height: 1.6; font-size: 15px;
+  }
+  .ask-answer strong { color: #fff; }
+  .ask-answer ol, .ask-answer ul { margin: 8px 0 0 18px; }
+  .ask-answer ul ul { margin: 4px 0 6px 16px; }
+  .ask-answer ul ul li { color: #b9c4d4; font-size: 14px; margin-bottom: 3px; }
+  .ask-answer .ans-head { font-weight: 600; margin: 14px 0 2px; }
+  .ask-answer li { margin-bottom: 8px; }
+  .ask-trace {
+    margin-top: 14px; padding-top: 12px; border-top: 1px solid #1e2532;
+    font-size: 11px; color: var(--muted); letter-spacing: .03em;
+  }
+  .ask-trace code {
+    background: #0c1119; padding: 2px 7px; border-radius: 5px; color: #8fb6ff;
+    margin-right: 8px; display: inline-block; margin-bottom: 3px;
+  }
+  .thinking { color: var(--muted); font-size: 14px; }
+  .map-wrap { margin-top: 18px; }
+  .map-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
+  }
+  .map-title {
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted);
+  }
+  .map-legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); }
+  .map-legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
+  .map-svg {
+    width: 100%; height: 420px; display: block; border-radius: 12px;
+    background: #0c1119; border: 1px solid #1e2532;
+  }
   .faces-label {
     font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
     color: var(--muted); margin: 22px 0 4px;
@@ -567,6 +626,12 @@ INDEX_HTML = """<!doctype html>
   .face-where { color: var(--muted); font-size: 13px; margin-top: 2px; }
   .face-why { font-size: 13px; margin-top: 4px; color: #cdd3dd; }
   .face-feed { font-size: 12px; margin-top: 3px; color: var(--muted); }
+  .face-sign { margin-top: 6px; }
+  .face-sign code {
+    display: block; font-size: 11px; line-height: 1.5; color: #7d8da0;
+    background: #0c1119; border: 1px solid #1b2331; border-radius: 6px;
+    padding: 5px 9px; margin-bottom: 4px; word-break: break-word;
+  }
   .face-dist { flex: 0 0 auto; color: var(--muted); font-size: 13px; text-align: right; }
   @media (max-width: 620px) {
     .face { flex-wrap: wrap; }
@@ -664,13 +729,28 @@ INDEX_HTML = """<!doctype html>
     <div class="eyebrow">NYC Vision Hack &middot; Sheepshead Bay, Brooklyn</div>
     <h1>Which street should I try?</h1>
     <div class="sub">
-      Type where you're headed. We rank the blocks around it by where you're most
-      likely to actually find a legal spot &mdash; so you stop circling.
+      Ask about any address in Sheepshead Bay. It reads the posted DOT signs on every
+      block around it and tells you where you're allowed to leave the car, and until when.
       <span class="live"><span class="dot"></span><span id="tick">connecting&hellip;</span></span>
     </div>
   </header>
 
   <section class="card lookup hero">
+    <form id="ask-form" class="addr-row" autocomplete="off">
+      <input id="ask" type="text" aria-label="Ask a question"
+             placeholder="I get home to 1822 Avenue X around 7pm — where should I park?" />
+      <button type="submit">Ask</button>
+    </form>
+    <div class="ask-examples">
+      <button type="button" class="chip" data-q="I get home to 1822 Avenue X around 7pm, where should I park?">arriving at 7pm</button>
+      <button type="button" class="chip" data-q="Is it worth driving to 2650 E 14th St right now or should I wait an hour?">now or wait an hour?</button>
+      <button type="button" class="chip" data-q="What happens to parking near 1822 Avenue X on August 15th?">what about Aug 15?</button>
+    </div>
+    <div id="ask-answer"></div>
+  </section>
+
+  <section class="card lookup">
+    <div class="lookup-hint">Or look up an address directly.</div>
     <form id="addr-form" class="addr-row" autocomplete="off">
       <input id="addr" type="text" placeholder="2650 E 14th St" aria-label="Address" />
       <select id="arriving" aria-label="When are you arriving">
@@ -684,6 +764,7 @@ INDEX_HTML = """<!doctype html>
     </form>
     <div id="addr-status" class="addr-status"></div>
     <div id="top-pick"></div>
+    <div id="map"></div>
     <div id="faces"></div>
   </section>
 
@@ -728,8 +809,9 @@ INDEX_HTML = """<!doctype html>
 
   <footer>
     <div><strong>Privacy:</strong> vehicle counts only. No license plates, no faces, no frames stored.</div>
-    <div><strong>Honest limitation:</strong> this is a demand estimate, not a spot finder. It tells you
-      how hard the search will be, not where an open space is.</div>
+    <div><strong>Honest limitation:</strong> this tells you where parking is <em>legal</em> and for how
+      long. It cannot tell you a space is empty &mdash; no public feed publishes that. Every block listed
+      already has cars on it.</div>
     <div>Source: NYC DOT Traffic Management Center public cameras (webcams.nyctmc.org). Refreshes every 5s.</div>
   </footer>
 
@@ -907,6 +989,166 @@ async function updateTrend() {
   }
 }
 
+// --- Ask: natural language in, the agent picks its own tools ---
+//
+// The trace is shown on purpose. A parking recommendation you cannot audit is worth
+// very little, and listing which tools ran is the difference between an answer and a
+// claim.
+
+const askForm   = document.getElementById("ask-form");
+const askInput  = document.getElementById("ask");
+const askAnswer = document.getElementById("ask-answer");
+
+// The model replies in light markdown. Rendering it by hand keeps the page free of
+// any external library, which matters when the venue wifi is the weak link.
+function miniMarkdown(text) {
+  const lines = esc(text).split(String.fromCharCode(10));
+  let html = "";
+  let depth = 0;   // how many <ul> are currently open
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    const item = line.match(/^(?:[-*]|\d+\.)\s+(.*)$/);
+    if (item) {
+      // Indentation in the source decides nesting. The model emits sub-points
+      // indented under a heading item; rendering every bullet at one level turned
+      // "street / distance / rule" into three sibling bullets and made the answer
+      // read as an undifferentiated list.
+      const want = Math.min(1 + Math.floor((raw.match(/^\s*/)[0].length) / 2), 2);
+      while (depth < want) { html += "<ul>"; depth++; }
+      while (depth > want) { html += "</ul>"; depth--; }
+      html += "<li>" + item[1] + "</li>";
+      continue;
+    }
+
+    while (depth > 0) { html += "</ul>"; depth--; }
+    // A short bold-only line is a heading, not a paragraph.
+    if (/^\*\*[^*]+\*\*:?$/.test(line) || /^#{1,4}\s/.test(line)) {
+      html += "<p class='ans-head'>" + line.replace(/^#{1,4}\s*/, "") + "</p>";
+    } else {
+      html += "<p>" + line + "</p>";
+    }
+  }
+  while (depth > 0) { html += "</ul>"; depth--; }
+  return html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+
+async function askAgent(question) {
+  if (!question) return;
+  const button = askForm.querySelector("button");
+  button.disabled = true;
+  askAnswer.className = "ask-answer";
+  askAnswer.innerHTML = '<div class="thinking">Reading the signs and the cameras&hellip;</div>';
+
+  try {
+    const r = await fetch("/api/ask?q=" + encodeURIComponent(question), { cache: "no-store" });
+    const d = await r.json();
+    if (!r.ok) {
+      askAnswer.innerHTML = '<div class="thinking">' + esc(d.error || "That did not work.") + '</div>';
+      return;
+    }
+    const tools = (d.trace || []).map(t => "<code>" + esc(t.tool) + "</code>").join("");
+    askAnswer.innerHTML =
+      miniMarkdown(d.answer) +
+      '<div class="ask-trace">Tools used: ' + (tools || "none") +
+        ' &middot; ' + esc(d.model || "") + '</div>';
+  } catch (e) {
+    askAnswer.innerHTML = '<div class="thinking">Request failed: ' + esc(e.message) + '</div>';
+  } finally {
+    button.disabled = false;
+  }
+}
+
+askForm.addEventListener("submit", function (ev) {
+  ev.preventDefault();
+  askAgent(askInput.value.trim());
+});
+
+document.querySelectorAll(".chip").forEach(function (chip) {
+  chip.addEventListener("click", function () {
+    askInput.value = chip.dataset.q;
+    askAgent(chip.dataset.q);
+  });
+});
+
+// --- Map: where these blocks actually are, relative to the address ---
+//
+// Hand-drawn SVG rather than a tile map. The API returns each block face as an
+// offset in feet east/north of the address, and NY State Plane is already a flat
+// grid in feet, so plotting is a subtraction and a scale -- no projection, no tile
+// server, no external library, nothing to fail on a venue wifi at 8:45 PM.
+
+const PILL_COLOR = { good: "#6ee7a0", fair: "#f5d67b", tight: "#f0b37b", no: "#ff9d9d" };
+
+function renderMap(d) {
+  const el = document.getElementById("map");
+  const faces = (d.block_faces || []).filter(b => b.dx_ft !== undefined);
+  if (!faces.length) { el.innerHTML = ""; return; }
+
+  const W = 720, H = 440, pad = 34;
+  const reach = Math.max(300, ...faces.map(b => Math.max(Math.abs(b.dx_ft), Math.abs(b.dy_ft))));
+  // Vertical is the tighter axis, so it sets the scale; the extra horizontal room
+  // just means the map breathes rather than distorting the geometry.
+  const scale = (H / 2 - pad) / reach;
+
+  // East is +x on screen; north is +y in state plane but -y in SVG, so flip it.
+  const px = ft => (W / 2 + ft * scale);
+  const py = ft => (H / 2 - ft * scale);
+
+  // Distance rings, so "2 min walk" has a visual scale attached.
+  const rings = [500, 1000, 1500]
+    .filter(r => r * scale < Math.min(W, H) / 2)
+    .map(r =>
+      '<circle cx="' + (W/2) + '" cy="' + (H/2) + '" r="' + (r * scale).toFixed(1) + '" ' +
+        'fill="none" stroke="#1c2431" stroke-width="1"/>' +
+      '<text x="' + (W/2 + r * scale - 4) + '" y="' + (H/2 - 5) + '" fill="#3d4757" ' +
+        'font-size="9" text-anchor="end">' + r + ' ft</text>'
+    ).join("");
+
+  const dots = faces.map(function (b, i) {
+    const x = px(b.dx_ft), y = py(b.dy_ft);
+    const isTop = i === 0;
+    const c = PILL_COLOR[b.confidence] || "#8aa";
+    const r = isTop ? 9 : 6;
+    return '<g>' +
+      (isTop ? '<circle cx="' + x + '" cy="' + y + '" r="15" fill="' + c + '" opacity="0.16"/>' : '') +
+      '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="' + c + '" ' +
+        'stroke="#0c1119" stroke-width="2">' +
+        '<title>' + esc(b.street) + ' — ' + esc(b.side) + ' · ' + esc(b.reason) +
+        ' · ' + b.walk_minutes + ' min walk</title>' +
+      '</circle>' +
+      (isTop
+        ? '<text x="' + x + '" y="' + (y - 20) + '" fill="#e8ecf3" font-size="12" ' +
+          'font-weight="700" text-anchor="middle">' + esc(b.street) + '</text>'
+        : '') +
+    '</g>';
+  }).join("");
+
+  // The address itself.
+  const pin =
+    '<circle cx="' + (W/2) + '" cy="' + (H/2) + '" r="5" fill="#6aa9ff"/>' +
+    '<circle cx="' + (W/2) + '" cy="' + (H/2) + '" r="11" fill="none" stroke="#6aa9ff" stroke-width="1.5" opacity="0.6"/>' +
+    '<text x="' + (W/2) + '" y="' + (H/2 + 26) + '" fill="#6aa9ff" font-size="11" ' +
+      'text-anchor="middle">you</text>';
+
+  el.className = "map-wrap";
+  el.innerHTML =
+    '<div class="map-head">' +
+      '<span class="map-title">Where these blocks are</span>' +
+      '<span class="map-legend">' +
+        '<span><i style="background:#6ee7a0"></i>good</span>' +
+        '<span><i style="background:#f5d67b"></i>fair</span>' +
+        '<span><i style="background:#f0b37b"></i>tight</span>' +
+        '<span><i style="background:#6aa9ff"></i>your address</span>' +
+      '</span>' +
+    '</div>' +
+    '<svg class="map-svg" viewBox="0 0 ' + W + ' ' + H + '">' +
+      '<text x="' + (W/2) + '" y="16" fill="#3d4757" font-size="10" text-anchor="middle">N</text>' +
+      rings + dots + pin +
+    '</svg>';
+}
+
 // --- Address lookup: which block faces near me can I actually park on? ---
 
 const addrForm   = document.getElementById("addr-form");
@@ -917,6 +1159,7 @@ const facesEl    = document.getElementById("faces");
 function renderFaces(d) {
   const topEl = document.getElementById("top-pick");
   topEl.innerHTML = "";
+  document.getElementById("map").innerHTML = "";
 
   if (!d.in_coverage) {
     facesEl.innerHTML = "";
@@ -956,16 +1199,27 @@ function renderFaces(d) {
     "Matched <strong>" + esc(d.location.matched) + "</strong> via " + esc(d.location.source) +
     ". " + aspLine;
 
+  renderMap(d);
+
   facesEl.innerHTML = '<div class="faces-label">Backups, in order</div>' +
     d.block_faces.slice(1).map(function (b) {
     const when = b.legal_now
       ? (b.until_human ? "until " + esc(b.until_human) : "no posted limit")
       : "not now";
-    const f = b.feeder_camera;
-    const feedLine = f
-      ? '<div class="face-feed">Traffic in via ' + esc(f.camera) +
-        ' &mdash; <strong>' + esc(f.congestion_inbound) + '</strong>' +
-        (f.pressure > 0.05 ? ' (competition for this block)' : ' (little competition)') +
+    const bits = [];
+    if (b.approx_spaces) bits.push("~" + b.approx_spaces + " spaces");
+    if (b.pressure) {
+      bits.push(b.pressure.complaints_6mo + " parking complaints in 6mo (" +
+                esc(b.pressure.level) + ")");
+    }
+    const feedLine = bits.length
+      ? '<div class="face-feed">' + bits.join(" &middot; ") + '</div>'
+      : "";
+    // The actual posted sign text. This is the thing the whole project exists to
+    // translate, and showing it is what makes the answer above it believable.
+    const signLine = (b.rules && b.rules.length)
+      ? '<div class="face-sign">' +
+          b.rules.slice(0, 2).map(r => '<code>' + esc(r) + '</code>').join("") +
         '</div>'
       : "";
     return '' +
@@ -975,7 +1229,7 @@ function renderFaces(d) {
           '<div class="face-street">' + esc(b.street) + ' — ' + esc(b.side) + '</div>' +
           '<div class="face-where">' + esc(b.between || "") + '</div>' +
           '<div class="face-why">' + esc(b.reason) + '</div>' +
-          feedLine +
+          feedLine + signLine +
         '</div>' +
         '<div class="face-dist">' +
           esc(String(b.walk_minutes)) + ' min walk<br>' +
