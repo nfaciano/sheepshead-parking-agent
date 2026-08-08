@@ -534,6 +534,16 @@ INDEX_HTML = """<!doctype html>
   .top-street { font-size: 26px; font-weight: 700; line-height: 1.15; }
   .top-between { color: var(--muted); font-size: 14px; margin-top: 3px; }
   .top-why { font-size: 15px; color: #dfe6ef; margin-top: 10px; }
+  .top-sign { margin-top: 12px; }
+  .top-sign-label {
+    display: block; font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+    color: #6f8f7c; margin-bottom: 5px;
+  }
+  .top-sign code {
+    display: block; font-size: 11.5px; line-height: 1.5; color: #9fb8a8;
+    background: #0b1610; border: 1px solid #223a2b; border-radius: 6px;
+    padding: 7px 10px; margin-bottom: 4px; word-break: break-word;
+  }
   .top-meta {
     display: flex; gap: 20px; flex-wrap: wrap; margin-top: 12px;
     font-size: 13px; color: var(--muted);
@@ -547,6 +557,8 @@ INDEX_HTML = """<!doctype html>
     font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted);
   }
   .trend-verdict { font-size: 14px; color: #dfe6ef; }
+  #trend-svg g.bar { cursor: crosshair; }
+  #trend-svg g.bar:hover rect + rect { opacity: 1; }
   .trend-note { font-size: 11px; color: var(--muted); margin-top: 8px; max-width: 78ch; }
   .ask-examples { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
   .chip {
@@ -573,20 +585,6 @@ INDEX_HTML = """<!doctype html>
     margin-right: 8px; display: inline-block; margin-bottom: 3px;
   }
   .thinking { color: var(--muted); font-size: 14px; }
-  .map-wrap { margin-top: 18px; }
-  .map-head {
-    display: flex; justify-content: space-between; align-items: baseline;
-    gap: 12px; flex-wrap: wrap; margin-bottom: 8px;
-  }
-  .map-title {
-    font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted);
-  }
-  .map-legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); }
-  .map-legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
-  .map-svg {
-    width: 100%; height: 420px; display: block; border-radius: 12px;
-    background: #0c1119; border: 1px solid #1e2532;
-  }
   .faces-label {
     font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
     color: var(--muted); margin: 22px 0 4px;
@@ -764,7 +762,6 @@ INDEX_HTML = """<!doctype html>
     </form>
     <div id="addr-status" class="addr-status"></div>
     <div id="top-pick"></div>
-    <div id="map"></div>
     <div id="faces"></div>
   </section>
 
@@ -774,15 +771,15 @@ INDEX_HTML = """<!doctype html>
     <p class="verdict-sub" id="subtext">Pulling live frames from the NYC DOT Traffic Management Center.</p>
     <div class="stats">
       <div>
-        <div class="stat-label">Parking pressure</div>
+        <div class="stat-label" title="How hard the search is likely to be across the neighbourhood right now. A heuristic, not a measurement.">Parking pressure</div>
         <div class="stat-val accent"><span id="score">--</span><span style="font-size:20px;color:var(--muted)">/100</span></div>
       </div>
       <div>
-        <div class="stat-label">Net inbound</div>
+        <div class="stat-label" title="Vehicles visible on the inbound side minus the outbound side, across all four cameras, in the latest frame. A snapshot -- not a running total, and not a count of cars that arrived.">Net in frame now</div>
         <div class="stat-val" id="net">--</div>
       </div>
       <div>
-        <div class="stat-label">Trend</div>
+        <div class="stat-label" title="Direction of the pressure score since we started watching tonight.">Trend</div>
         <div class="stat-val" id="trend">--</div>
       </div>
       <div>
@@ -926,30 +923,53 @@ async function drawTrendChart() {
       const up = x.net_inbound >= 0;
       const y = up ? (H / 2 - h) : (H / 2);
       const fill = up ? "#ff8f6b" : "#6ee7a0";
-      return '<rect x="' + (i * bw + gap).toFixed(2) + '" y="' + y.toFixed(2) +
-             '" width="' + (bw - gap * 2).toFixed(2) + '" height="' + Math.max(h, 0.6).toFixed(2) +
-             '" fill="' + fill + '" opacity="0.9"><title>' +
-             esc(x.label) + ' — net ' + (x.net_inbound > 0 ? "+" : "") + x.net_inbound +
-             ' (' + x.readings + ' readings)</title></rect>';
+      // A transparent full-height rect behind each bar, so hovering anywhere in the
+      // column reads out -- aiming at a 2px-tall bar is not a hover target.
+      return '<g class="bar" data-i="' + i + '">' +
+        '<rect x="' + (i * bw).toFixed(2) + '" y="0" width="' + bw.toFixed(2) +
+          '" height="' + H + '" fill="transparent"/>' +
+        '<rect x="' + (i * bw + gap).toFixed(2) + '" y="' + y.toFixed(2) +
+          '" width="' + (bw - gap * 2).toFixed(2) + '" height="' + Math.max(h, 0.6).toFixed(2) +
+          '" fill="' + fill + '" opacity="0.9"/>' +
+      '</g>';
     }).join("");
 
     const s = d.summary || {};
+    const defaultReadout =
+      esc(s.from_label || "") + ' → ' + esc(s.to_label || "") + ': <strong>' +
+      esc(s.direction || "—") + '</strong>' +
+      (s.readings ? ' · ' + esc(String(s.readings)) + ' readings' : '');
+
     el.innerHTML =
       '<div class="trend-head">' +
         '<span class="trend-title">Pressure since we started watching</span>' +
-        '<span class="trend-verdict">' +
-          esc(s.from_label || "") + ' → ' + esc(s.to_label || "") + ': <strong>' +
-          esc(s.direction || "—") + '</strong>' +
-          (s.readings ? ' · ' + esc(String(s.readings)) + ' readings' : '') +
-        '</span>' +
+        '<span class="trend-verdict" id="trend-readout">' + defaultReadout + '</span>' +
       '</div>' +
       '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" ' +
-        'style="width:100%;height:56px;display:block">' +
+        'style="width:100%;height:56px;display:block" id="trend-svg">' +
         '<line x1="0" y1="' + (H / 2) + '" x2="' + W + '" y2="' + (H / 2) +
           '" stroke="#2a3342" stroke-width="0.3"/>' +
         bars +
       '</svg>' +
       '<div class="trend-note">' + esc(d.measures || "") + '</div>';
+
+    // Hovering a column swaps the summary line for that bucket's numbers, and
+    // leaving the chart puts the summary back.
+    const readout = document.getElementById("trend-readout");
+    el.querySelectorAll("g.bar").forEach(function (g) {
+      g.addEventListener("mouseenter", function () {
+        const x = b[Number(g.dataset.i)];
+        if (!x) return;
+        readout.innerHTML =
+          '<strong>' + esc(x.label) + '</strong> &middot; ' +
+          'avg <strong>' + (x.net_inbound > 0 ? "+" : "") + x.net_inbound + '</strong>' +
+          ' more vehicles standing on the inbound side than the outbound side' +
+          ' &middot; ' + x.readings + ' reading' + (x.readings === 1 ? "" : "s");
+      });
+    });
+    document.getElementById("trend-svg").addEventListener("mouseleave", function () {
+      readout.innerHTML = defaultReadout;
+    });
   } catch (e) {
     // A missing chart must never break the page.
   }
@@ -1072,83 +1092,6 @@ document.querySelectorAll(".chip").forEach(function (chip) {
   });
 });
 
-// --- Map: where these blocks actually are, relative to the address ---
-//
-// Hand-drawn SVG rather than a tile map. The API returns each block face as an
-// offset in feet east/north of the address, and NY State Plane is already a flat
-// grid in feet, so plotting is a subtraction and a scale -- no projection, no tile
-// server, no external library, nothing to fail on a venue wifi at 8:45 PM.
-
-const PILL_COLOR = { good: "#6ee7a0", fair: "#f5d67b", tight: "#f0b37b", no: "#ff9d9d" };
-
-function renderMap(d) {
-  const el = document.getElementById("map");
-  const faces = (d.block_faces || []).filter(b => b.dx_ft !== undefined);
-  if (!faces.length) { el.innerHTML = ""; return; }
-
-  const W = 720, H = 440, pad = 34;
-  const reach = Math.max(300, ...faces.map(b => Math.max(Math.abs(b.dx_ft), Math.abs(b.dy_ft))));
-  // Vertical is the tighter axis, so it sets the scale; the extra horizontal room
-  // just means the map breathes rather than distorting the geometry.
-  const scale = (H / 2 - pad) / reach;
-
-  // East is +x on screen; north is +y in state plane but -y in SVG, so flip it.
-  const px = ft => (W / 2 + ft * scale);
-  const py = ft => (H / 2 - ft * scale);
-
-  // Distance rings, so "2 min walk" has a visual scale attached.
-  const rings = [500, 1000, 1500]
-    .filter(r => r * scale < Math.min(W, H) / 2)
-    .map(r =>
-      '<circle cx="' + (W/2) + '" cy="' + (H/2) + '" r="' + (r * scale).toFixed(1) + '" ' +
-        'fill="none" stroke="#1c2431" stroke-width="1"/>' +
-      '<text x="' + (W/2 + r * scale - 4) + '" y="' + (H/2 - 5) + '" fill="#3d4757" ' +
-        'font-size="9" text-anchor="end">' + r + ' ft</text>'
-    ).join("");
-
-  const dots = faces.map(function (b, i) {
-    const x = px(b.dx_ft), y = py(b.dy_ft);
-    const isTop = i === 0;
-    const c = PILL_COLOR[b.confidence] || "#8aa";
-    const r = isTop ? 9 : 6;
-    return '<g>' +
-      (isTop ? '<circle cx="' + x + '" cy="' + y + '" r="15" fill="' + c + '" opacity="0.16"/>' : '') +
-      '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="' + c + '" ' +
-        'stroke="#0c1119" stroke-width="2">' +
-        '<title>' + esc(b.street) + ' — ' + esc(b.side) + ' · ' + esc(b.reason) +
-        ' · ' + b.walk_minutes + ' min walk</title>' +
-      '</circle>' +
-      (isTop
-        ? '<text x="' + x + '" y="' + (y - 20) + '" fill="#e8ecf3" font-size="12" ' +
-          'font-weight="700" text-anchor="middle">' + esc(b.street) + '</text>'
-        : '') +
-    '</g>';
-  }).join("");
-
-  // The address itself.
-  const pin =
-    '<circle cx="' + (W/2) + '" cy="' + (H/2) + '" r="5" fill="#6aa9ff"/>' +
-    '<circle cx="' + (W/2) + '" cy="' + (H/2) + '" r="11" fill="none" stroke="#6aa9ff" stroke-width="1.5" opacity="0.6"/>' +
-    '<text x="' + (W/2) + '" y="' + (H/2 + 26) + '" fill="#6aa9ff" font-size="11" ' +
-      'text-anchor="middle">you</text>';
-
-  el.className = "map-wrap";
-  el.innerHTML =
-    '<div class="map-head">' +
-      '<span class="map-title">Where these blocks are</span>' +
-      '<span class="map-legend">' +
-        '<span><i style="background:#6ee7a0"></i>good</span>' +
-        '<span><i style="background:#f5d67b"></i>fair</span>' +
-        '<span><i style="background:#f0b37b"></i>tight</span>' +
-        '<span><i style="background:#6aa9ff"></i>your address</span>' +
-      '</span>' +
-    '</div>' +
-    '<svg class="map-svg" viewBox="0 0 ' + W + ' ' + H + '">' +
-      '<text x="' + (W/2) + '" y="16" fill="#3d4757" font-size="10" text-anchor="middle">N</text>' +
-      rings + dots + pin +
-    '</svg>';
-}
-
 // --- Address lookup: which block faces near me can I actually park on? ---
 
 const addrForm   = document.getElementById("addr-form");
@@ -1159,7 +1102,6 @@ const facesEl    = document.getElementById("faces");
 function renderFaces(d) {
   const topEl = document.getElementById("top-pick");
   topEl.innerHTML = "";
-  document.getElementById("map").innerHTML = "";
 
   if (!d.in_coverage) {
     facesEl.innerHTML = "";
@@ -1180,6 +1122,11 @@ function renderFaces(d) {
         '<div class="top-street">' + esc(rec.street) + ' — ' + esc(rec.side) + '</div>' +
         '<div class="top-between">' + esc(rec.between || "") + '</div>' +
         '<div class="top-why">' + esc(rec.why) + '</div>' +
+        ((rec.rules && rec.rules.length)
+          ? '<div class="top-sign"><span class="top-sign-label">translated from the posted sign</span>' +
+            rec.rules.slice(0, 2).map(r => '<code>' + esc(r) + '</code>').join("") +
+            '</div>'
+          : '') +
         '<div class="top-meta">' +
           '<span><strong>' + esc(String(rec.walk_minutes)) + ' min</strong> walk · ' +
             esc(String(rec.distance_ft)) + ' ft</span>' +
@@ -1198,8 +1145,6 @@ function renderFaces(d) {
   addrStatus.innerHTML =
     "Matched <strong>" + esc(d.location.matched) + "</strong> via " + esc(d.location.source) +
     ". " + aspLine;
-
-  renderMap(d);
 
   facesEl.innerHTML = '<div class="faces-label">Backups, in order</div>' +
     d.block_faces.slice(1).map(function (b) {

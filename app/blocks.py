@@ -411,11 +411,28 @@ def nearby(
         )
 
         feed = _camera_pressure(face["x"], face["y"], cameras or [])
-        if feed and verdict["legal"]:
-            # Cars arriving through the nearest gateway compete for this block.
-            # Cap the hit at 30% -- a busy road makes a legal block a worse bet,
-            # but it never makes it as bad as an illegal one.
-            score = int(round(score * (1.0 - 0.30 * feed["pressure"])))
+        contested = pressure.for_block(
+            face["on_street"], face["from_street"], face["to_street"], face["side"]
+        )
+
+        if verdict["legal"]:
+            # Two independent discounts, both capped so neither can outrank legality.
+            #
+            # The gateway camera says how much traffic is arriving in the area right
+            # now. The 311 history says how contested this particular block has been
+            # over six months. The camera is live but neighbourhood-wide; the
+            # complaints are local but historical. Applying both means a block that is
+            # normally fought over AND is being fed by a jammed road ranks below an
+            # otherwise identical quiet one -- which is the whole point of collecting
+            # them separately.
+            if feed:
+                score = int(round(score * (1.0 - 0.30 * feed["pressure"])))
+            if contested:
+                # Ranked against the neighbourhood, not on an absolute count: a block
+                # with 40 complaints is contested in Sheepshead Bay terms, which is
+                # what matters when choosing between blocks in Sheepshead Bay.
+                penalty = {"high": 0.20, "moderate": 0.08}.get(contested["level"], 0.0)
+                score = int(round(score * (1.0 - penalty)))
             label = "good" if score >= 80 else "fair" if score >= 68 else "tight"
 
         between = ""
@@ -441,9 +458,7 @@ def nearby(
             # How contested this block actually is, from 311 illegal-parking
             # complaints snapped to it. Unlike the cameras, this covers every block
             # in the neighborhood and is about parking rather than through-traffic.
-            "pressure": pressure.for_block(
-                face["on_street"], face["from_street"], face["to_street"], face["side"]
-            ),
+            "pressure": contested,
             # Roughly how many cars the stretch holds, so "try this block" has a size.
             "approx_spaces": _approx_spaces(face),
             # Offsets in feet from the queried address, east and north positive.
@@ -489,10 +504,21 @@ def lookup(address: str, when: Optional[dt.datetime] = None, **kwargs) -> dict:
             "walk_minutes": top["walk_minutes"],
             "distance_ft": top["distance_ft"],
             "why": top["reason"],
+            # The posted sign this answer was derived from. Showing it next to the
+            # plain-English version is the clearest proof the translation is real.
+            "rules": top["rules"],
             "confidence": top["confidence"],
             "confidence_score": top["confidence_score"],
+            # Include the cross streets: the runner-up is often the same street and
+            # side as the top pick, just a different stretch of it, and without them
+            # the two lines read as the same place named twice.
             "backup": (
-                f"{faces[1]['street']}, {faces[1]['side']}" if len(faces) > 1 else None
+                ", ".join(
+                    p for p in (
+                        faces[1]["street"], faces[1]["side"], faces[1]["between"]
+                    ) if p
+                )
+                if len(faces) > 1 else None
             ),
         }
 

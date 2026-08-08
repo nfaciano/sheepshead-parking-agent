@@ -83,7 +83,12 @@ def series(live_samples: list[dict], bucket_minutes: int = 5) -> dict:
             stamp = dt.datetime.fromisoformat(p["t"])
         except ValueError:
             continue
+        # The seed file writes naive local timestamps; the service writes offset-aware
+        # ones. Keying on isoformat() then puts "19:35:00" and "19:35:00-04:00" in
+        # separate buckets, so the same five minutes appeared twice on the chart.
+        # Strip the offset -- both sources are already New York wall-clock.
         floored = stamp.replace(
+            tzinfo=None,
             minute=(stamp.minute // bucket_minutes) * bucket_minutes,
             second=0,
             microsecond=0,
@@ -103,15 +108,30 @@ def series(live_samples: list[dict], bucket_minutes: int = 5) -> dict:
     if len(series_out) >= 2:
         first, last = series_out[0], series_out[-1]
         delta = last["net_inbound"] - first["net_inbound"]
-        if delta > 1.5:
-            verdict = "filling up"
-        elif delta < -1.5:
-            verdict = "emptying out"
+        now = last["net_inbound"]
+
+        # Two independent facts, and conflating them was wrong. `delta` is whether
+        # the inflow is rising or falling since we started watching; `now` is whether
+        # cars are currently arriving faster than they leave. A rush hour that peaks
+        # and subsides has a strongly negative delta while net inflow is still
+        # positive -- calling that "emptying out" said the neighbourhood was draining
+        # when it was still filling, just more slowly.
+        rising = delta > 1.5
+        falling = delta < -1.5
+
+        if now > 1.5:
+            verdict = "still filling, but easing off" if falling else (
+                "filling faster" if rising else "filling steadily")
+        elif now < -1.5:
+            verdict = "emptying out" if falling or not rising else "draining, but slowing"
         else:
-            verdict = "holding steady"
+            verdict = "levelled off" if falling else (
+                "starting to fill" if rising else "holding steady")
+
         summary = {
             "direction": verdict,
             "delta": round(delta, 1),
+            "net_now": now,
             "from_label": first["label"],
             "to_label": last["label"],
             "readings": sum(b["readings"] for b in series_out),
@@ -121,8 +141,10 @@ def series(live_samples: list[dict], bucket_minutes: int = 5) -> dict:
         "buckets": series_out,
         "summary": summary,
         "measures": (
-            "Net vehicles heading in minus out, averaged per frame in each window. "
-            "This is a pressure level, not a count of cars that arrived -- one car "
-            "in stopped traffic appears in many consecutive frames."
+            "Vehicles standing on the inbound side of each camera minus the outbound "
+            "side, averaged across the readings in each window. It is a pressure level, "
+            "not a count of anything that arrived: nobody is counted crossing a line, "
+            "and congestion inflates the number because stopped traffic stays in frame "
+            "while free-flowing traffic does not."
         ),
     }
